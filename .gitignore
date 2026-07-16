@@ -1,0 +1,22 @@
+# build outputs
+plugin/*.o
+plugin/Speak.ofx
+plugin/Speak.ofx.bundle/
+release/
+
+# test binaries and outputs
+test/test_speak
+test/test_speak_metal
+test/test_speak_opencl
+test/test_speak_macbeth
+test/test_speak_split
+test/proto_halation
+test/render_speak
+test/compile_opencl
+test/test_describe
+test/*.ppm
+test/*.png
+test/*.air
+
+.DS_Store
+out_*.ppm
