@@ -38,14 +38,22 @@ static void gateLayout()
     printf("G1 struct layout parity\n");
     // All-4-byte-field invariant: sizeof must equal the field count * 4.
     const size_t profFields = 79;   // see SpeakParams.h; keep in sync (+3 hal +2 grain +3 bloom +2 vign +2 weave)
-    const size_t parFields  = 17 + profFields;   // +3 grain controls, +1 maskExternal (v0.3)
+    // v1.0: 16 v0.3 runtime fields + matteKeyMissing + statusStrip +
+    // statusText[28] = 46 ahead of the profile, then maskExternal after it.
+    const size_t parFields  = 47 + profFields;
     check(sizeof(float) == 4 && sizeof(int) == 4, "float/int are 4 bytes");
     check(sizeof(SpeakProfile) == profFields * 4, "sizeof(SpeakProfile)==316",
           (std::to_string(sizeof(SpeakProfile))).c_str());
-    check(sizeof(SpeakParams) == parFields * 4, "sizeof(SpeakParams)==384",
+    check(sizeof(SpeakParams) == parFields * 4, "sizeof(SpeakParams)==504",
           (std::to_string(sizeof(SpeakParams))).c_str());
-    check(offsetof(SpeakParams, profile) == 16 * 4, "profile offset==64",
+    check(offsetof(SpeakParams, profile) == 46 * 4, "profile offset==184",
           (std::to_string(offsetof(SpeakParams, profile))).c_str());
+    check(offsetof(SpeakParams, matteSource) == 14 * 4, "matteSource offset==56",
+          (std::to_string(offsetof(SpeakParams, matteSource))).c_str());
+    check(offsetof(SpeakParams, statusText) == 18 * 4, "statusText offset==72",
+          (std::to_string(offsetof(SpeakParams, statusText))).c_str());
+    check(offsetof(SpeakParams, maskExternal) == 125 * 4, "maskExternal offset==500",
+          (std::to_string(offsetof(SpeakParams, maskExternal))).c_str());
     // A few anchor offsets the GPU struct declarations must match.
     check(offsetof(SpeakProfile, printerLights) == 18 * 4, "printerLights offset==72");
     check(offsetof(SpeakProfile, prnDmin) == 22 * 4, "prnDmin offset==88");
@@ -886,13 +894,13 @@ static void gateGrainMean()
 
 static void gateGrainMatte()
 {
-    printf("G23 the Hush handoff: incoming alpha keys the grain\n");
+    printf("G23 the Hush handoff: the chosen matte source keys the grain\n");
     const int W = 128, H = 128;
-    // Alpha = 1 (fully cleaned) vs alpha = 0 (protected motion), grainMatte on,
-    // floor 0.3: the RMS ratio must be ~ the floor. Then grainMatte OFF must
-    // ignore alpha entirely (bit-identical output for any alpha).
+    // Incoming-alpha source (the opt-in in-band path). Alpha = 1 (fully
+    // cleaned) vs alpha = 0 (protected motion), floor 0.3: the RMS ratio must
+    // be ~ the floor. Then source OFF must ignore alpha entirely.
     SpeakParams pr = grainParams(1.0f, 0.10f);
-    pr.grainMatte = 1; pr.grainMatteFloor = 0.3f;
+    pr.matteSource = SPEAK_MATTE_ALPHA; pr.grainMatteFloor = 0.3f;
     std::vector<float> a1 = flatFrame(W, H, 0.18f, 1.0f), o1(a1.size());
     std::vector<float> a0 = flatFrame(W, H, 0.18f, 0.0f), o0(a0.size());
     speakFrame(a1.data(), W, H, pr, o1.data());
@@ -910,8 +918,8 @@ static void gateGrainMatte()
     check(std::fabs(rh / r1 - 0.65) < 0.05, "G23c matte on: alpha 0.5 lands at lerp(floor,1,0.5)",
           (std::string("ratio=") + std::to_string(rh / r1)).c_str());
 
-    // grainMatte OFF: alpha is not read at all — outputs bit-identical.
-    SpeakParams po = pr; po.grainMatte = 0;
+    // Source OFF: alpha is not read at all — outputs bit-identical.
+    SpeakParams po = pr; po.matteSource = SPEAK_MATTE_OFF;
     std::vector<float> x1(a1.size()), x0(a0.size());
     speakFrame(a1.data(), W, H, po, x1.data());
     speakFrame(a0.data(), W, H, po, x0.data());
@@ -920,11 +928,156 @@ static void gateGrainMatte()
         if (x1[k] != x0[k] || x1[k + 1] != x0[k + 1] || x1[k + 2] != x0[k + 2]) same = false;
     check(same, "G23d matte off: alpha is ignored entirely (RGB bit-identical across alpha)");
 
-    // The matte SURVIVES Speak: output alpha == input alpha in all cases.
+    // Kernel alpha contract, both halves. maskExternal=0 (source off in the
+    // plugin): alpha passes through. maskExternal=1 (any active source —
+    // consume-on-use): output alpha forced opaque, the matte never rides
+    // past its consumer.
     bool aPass = true;
-    for (size_t k = 3; k < o0.size(); k += 4) if (o0[k] != 0.0f) aPass = false;
-    for (size_t k = 3; k < o1.size(); k += 4) if (o1[k] != 1.0f) aPass = false;
-    check(aPass, "G23e alpha passes through untouched (the matte survives for later nodes)");
+    for (size_t k = 3; k < x0.size(); k += 4) if (x0[k] != 0.0f) aPass = false;
+    for (size_t k = 3; k < x1.size(); k += 4) if (x1[k] != 1.0f) aPass = false;
+    check(aPass, "G23e no matte: alpha passes through untouched");
+    SpeakParams pc = pr; pc.maskExternal = 1;
+    std::vector<float> oc(a0.size());
+    speakFrame(a0.data(), W, H, pc, oc.data());
+    bool opaque = true;
+    for (size_t k = 3; k < oc.size(); k += 4) if (oc[k] != 1.0f) opaque = false;
+    check(opaque, "G23f consume-on-use: active source forces output alpha opaque");
+}
+
+// ---------------------------------------------------- G30 explicit key floor
+static void gateMatteKeyMissing()
+{
+    printf("G43 key selected but unwired: absence means absence (SPEC-1.0 S1)\n");
+    const int W = 128, H = 128;
+    // v0.3's trap: no key wired, incoming alpha opaque => FULL grain. v1.0:
+    // Key input + matteKeyMissing must sit AT THE FLOOR regardless of alpha.
+    SpeakParams pk = grainParams(1.0f, 0.10f);
+    pk.matteSource = SPEAK_MATTE_KEY; pk.matteKeyMissing = 1; pk.grainMatteFloor = 0.3f;
+    std::vector<float> a1 = flatFrame(W, H, 0.18f, 1.0f), ok(a1.size());
+    speakFrame(a1.data(), W, H, pk, ok.data());
+    SpeakParams pa = pk; pa.matteSource = SPEAK_MATTE_ALPHA; pa.matteKeyMissing = 0;
+    std::vector<float> a0 = flatFrame(W, H, 0.18f, 0.0f), o0(a0.size());
+    speakFrame(a0.data(), W, H, pa, o0.data());
+    const double rk = grainRmsD(a1, ok, 0), r0 = grainRmsD(a0, o0, 0);
+    printf("    rms(key missing, alpha=1)=%.5f  rms(matte=0)=%.5f\n", rk, r0);
+    check(std::fabs(rk / r0 - 1.0) < 0.02,
+          "G43a unwired key == matte 0 == the Floor (opaque alpha cannot inflate it)",
+          (std::string("ratio=") + std::to_string(rk / r0)).c_str());
+    // Sabotage arm: the OLD fallback (reading alpha) would have given full
+    // grain. Prove the gate can fail by measuring what v0.3 did.
+    SpeakParams pv = pk; pv.matteKeyMissing = 0; pv.matteSource = SPEAK_MATTE_ALPHA;
+    std::vector<float> ov(a1.size());
+    speakFrame(a1.data(), W, H, pv, ov.data());
+    const double rv = grainRmsD(a1, ov, 0);
+    check(rv / rk > 2.5, "G43b the v0.3 fallback WOULD have blown grain to full (measured)",
+          (std::string("v0.3/v1.0=") + std::to_string(rv / rk)).c_str());
+}
+
+// ------------------------------------------------------- G31 status strip
+static void gateStatusStrip()
+{
+    printf("G44 the status strip: plugin-composed text, kernel-drawn chrome\n");
+    const int W = 640, H = 360;
+    // Round-trip the packer (the plugin's writer vs the kernel's reader).
+    SpeakParams pr = grainParams(0.5f, 0.10f);
+    pr.statusStrip = 1;
+    packStatusText(pr, "6\x02grain | matte: key \x01 mean 0.31");
+    check(statusCharAt(pr, 0) == '6' && statusCharAt(pr, 1) == 2 &&
+          statusCharAt(pr, 8) == '|' && statusLen(pr) == 32,
+          "G44a packStatusText/statusCharAt round-trip");
+    std::vector<float> src = flatFrame(W, H, 0.18f, 1.0f);
+    std::vector<float> on(src.size()), off(src.size()), on2(src.size());
+    speakFrame(src.data(), W, H, pr, on.data());
+    speakFrame(src.data(), W, H, pr, on2.data());
+    SpeakParams po = pr; po.statusStrip = 0;
+    speakFrame(src.data(), W, H, po, off.data());
+    // The strip changes pixels ONLY in its bottom-left box; deterministic.
+    const int sc = 1, stripH = 7 * sc + 8 * sc, margin = 12 * sc;
+    long diffIn = 0, diffOut = 0, diffRun = 0;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const bool d = on[i] != off[i] || on[i+1] != off[i+1] || on[i+2] != off[i+2];
+            const int yd = H - 1 - y;
+            const bool inBox = x >= margin && yd >= H - margin - stripH && yd < H - margin;
+            if (d && inBox) diffIn++;
+            if (d && !inBox) diffOut++;
+            if (on[i] != on2[i]) diffRun++;
+        }
+    printf("    strip pixels changed=%ld outside box=%ld rerun diff=%ld\n", diffIn, diffOut, diffRun);
+    check(diffIn > 200, "G44b the strip draws (text pixels present in its box)");
+    check(diffOut == 0, "G44c the strip touches NOTHING outside its box");
+    check(diffRun == 0, "G44d deterministic: identical frames, bit-identical strip");
+    // Different text must draw differently (a gate that can fail).
+    SpeakParams p2 = pr;
+    packStatusText(p2, "6\x02grain | matte: key not connected");
+    std::vector<float> t2(src.size());
+    speakFrame(src.data(), W, H, p2, t2.data());
+    bool textMatters = false;
+    for (size_t k = 0; k < t2.size(); k += 4) if (t2[k] != on[k]) { textMatters = true; break; }
+    check(textMatters, "G44e the text is really rasterized (different text, different pixels)");
+    // Empty text = no strip at all (identity-at-default stays honest).
+    SpeakParams pe = pr;
+    packStatusText(pe, "");
+    std::vector<float> te(src.size());
+    speakFrame(src.data(), W, H, pe, te.data());
+    bool empty = true;
+    for (size_t k = 0; k < te.size(); ++k) if (te[k] != off[k]) { empty = false; break; }
+    check(empty, "G44f empty text draws nothing");
+    // Weave-pinned: the strip is chrome. With weave displacing the picture,
+    // the strip must sit on exactly the same pixels as with weave off.
+    SpeakParams pw = pr; pw.enableOptics = 1; pw.strength = 1.0f;
+    pw.profile.weaveAmount = 0.4f; pw.profile.weaveSpeed = 1.0f; pw.frameIndex = 7;
+    SpeakParams pwOff = pw; pwOff.statusStrip = 0;
+    std::vector<float> w1(src.size()), w0(src.size());
+    speakFrame(src.data(), W, H, pw, w1.data());
+    speakFrame(src.data(), W, H, pwOff, w0.data());
+    long wIn = 0, wOut = 0;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const bool d = w1[i] != w0[i] || w1[i+1] != w0[i+1] || w1[i+2] != w0[i+2];
+            const int yd = H - 1 - y;
+            const bool inBox = x >= margin && yd >= H - margin - stripH && yd < H - margin;
+            if (d && inBox) wIn++;
+            if (d && !inBox) wOut++;
+        }
+    check(wIn > 200 && wOut == 0, "G44g weave-pinned: the strip does not weave",
+          (std::string("in=") + std::to_string(wIn) + " out=" + std::to_string(wOut)).c_str());
+}
+
+// ------------------------------------------------------ G32 setup guide view
+static void gateSetupGuide()
+{
+    printf("G45 the Setup Guide view: the recipe card the kernel draws\n");
+    const int W = 960, H = 540;
+    SpeakParams pr = grainParams(0.5f, 0.10f);
+    pr.viewMode = SPEAK_VIEW_SETUP;
+    std::vector<float> srcA = flatFrame(W, H, 0.18f, 1.0f);
+    std::vector<float> srcB = flatFrame(W, H, 0.72f, 0.0f);
+    std::vector<float> oa(srcA.size()), ob(srcB.size());
+    speakFrame(srcA.data(), W, H, pr, oa.data());
+    speakFrame(srcB.data(), W, H, pr, ob.data());
+    // The card owns the frame: independent of the picture (RGB identical for
+    // two different inputs), card background where there is no text.
+    bool indep = true;
+    for (size_t k = 0; k < oa.size(); k += 4)
+        if (oa[k] != ob[k] || oa[k+1] != ob[k+1] || oa[k+2] != ob[k+2]) { indep = false; break; }
+    check(indep, "G45a the card ignores the picture (documentation, not a view of it)");
+    check(oa[0] == 0.045f, "G45b corner pixel is the card background");
+    long lit = 0, blue = 0;
+    for (size_t k = 0; k < oa.size(); k += 4) {
+        if (oa[k] > 0.5f) lit++;
+        if (oa[k+2] > 0.9f && oa[k] < 0.4f) blue++;
+    }
+    printf("    text pixels=%ld blue-wire pixels=%ld\n", lit, blue);
+    check(lit > 5000, "G45c the recipe text is rasterized (thousands of lit pixels)");
+    check(blue > 100, "G45d the BLUE key wire row is drawn blue");
+    // Alpha contract holds in this view too (srcB's alpha is 0 — a forced-
+    // opaque bug would read 1 here, so this check can actually fail).
+    bool aPass = true;
+    for (size_t k = 3; k < ob.size(); k += 4) if (ob[k] != 0.0f) aPass = false;
+    check(aPass, "G45e alpha passthrough in the guide view");
 }
 
 static void gateGrainStructure()
@@ -1744,6 +1897,9 @@ int main()
     gateGrainTemporal();
     gateGrainMean();
     gateGrainMatte();
+    gateMatteKeyMissing();
+    gateStatusStrip();
+    gateSetupGuide();
     gateGrainStructure();
     gateBloomIdentity();
     gateBloomEnergy();

@@ -13,6 +13,7 @@
 #include "SpeakPlugin.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -36,8 +37,8 @@
     "Curves to see the exact curve the pixels use.\n\n" \
     "Hush quiets the noise; Speak gives the image its voice. MIT-licensed, free."
 #define kSpeakIdentifier "org.opennr.Speak"
-#define kSpeakVersionMajor 0
-#define kSpeakVersionMinor 3
+#define kSpeakVersionMajor 1
+#define kSpeakVersionMinor 0
 
 #define kSupportsTiles false
 #define kSupportsMultiResolution false
@@ -165,11 +166,13 @@ public:
         m_EnableGrain   = fetchBooleanParam("enableGrain");
         m_GrainAmount   = fetchDoubleParam("grainAmount");
         m_GrainSize     = fetchDoubleParam("grainSize");
-        m_GrainMatte    = fetchBooleanParam("grainMatte");
+        m_MatteSource   = fetchChoiceParam("matteSource");
+        m_GrainMatte    = fetchBooleanParam("grainMatte");   // v0.3 legacy, secret
         m_GrainMatteFloor = fetchDoubleParam("grainMatteFloor");
         m_ViewMode      = fetchChoiceParam("viewMode");
         m_ScopeHD       = fetchBooleanParam("scopeHD");
         m_ScopeDensity  = fetchBooleanParam("scopeDensity");
+        m_StatusStrip   = fetchBooleanParam("statusStrip");
         updateEnabledness();
     }
 
@@ -191,6 +194,13 @@ public:
         if (vm != 0) return false;
         if (om != SPEAK_OUT_WORKING) return false;        // bake always transforms
         if (m_ScopeHD->getValueAtTime(t) || m_ScopeDensity->getValueAtTime(t)) return false;  // scopes must still draw
+        // Consume-on-use is a render effect: an active matte source forces the
+        // OUTPUT alpha opaque, so the host must not skip the render (v0.3 let
+        // it — the matte kept riding whenever every stage happened to be off).
+        // The status strip rides these same triggers rather than adding one:
+        // when the node is bit-exact identity there is nothing to report, and
+        // "identity at default" stays a true claim.
+        if (effectiveMatteSource(t) != SPEAK_MATTE_OFF) return false;
         const bool toneOn = m_EnableTone->getValueAtTime(t) && (m_Strength->getValueAtTime(t) > 0.0);
         const bool dyeOn  = m_EnableDye->getValueAtTime(t) &&
                             (m_SubSat->getValueAtTime(t) > 0.0 || m_DyeCoupler->getValueAtTime(t) > 0.0);
@@ -220,12 +230,33 @@ public:
 
     virtual void changedParam(const OFX::InstanceChangedArgs& /*p_Args*/, const std::string& p_ParamName)
     {
+        // Migration completes the moment the user answers the question the
+        // choice asks: an explicit Matte Source retires the v0.3 bool, so the
+        // legacy auto-resolution can never fight an explicit setting.
+        if (p_ParamName == "matteSource" && m_GrainMatte->getValue())
+            m_GrainMatte->setValue(false);
         if (p_ParamName == "enableTone" || p_ParamName == "enableDye" ||
             p_ParamName == "enableSplit" || p_ParamName == "enableOptics" ||
-            p_ParamName == "enableGrain" || p_ParamName == "grainMatte") updateEnabledness();
+            p_ParamName == "enableGrain" || p_ParamName == "matteSource") updateEnabledness();
     }
 
 private:
+    // The EFFECTIVE matte source (SPEC-1.0 §1). New projects: the explicit
+    // choice, verbatim. Old projects (v0.3's grainMatte bool still set,
+    // choice untouched at Off): resolve exactly as v0.3 rendered — key wired
+    // means the key drives, otherwise the incoming alpha does — so loading a
+    // v0.3 project cannot change a single pixel. The status strip says the
+    // resolution out loud; the first explicit choice retires the bool.
+    int effectiveMatteSource(double t)
+    {
+        int ms = 0;
+        m_MatteSource->getValueAtTime(t, ms);
+        if (ms != SPEAK_MATTE_OFF) return ms;
+        if (m_GrainMatte->getValueAtTime(t))
+            return (m_MaskClip && m_MaskClip->isConnected()) ? SPEAK_MATTE_KEY
+                                                             : SPEAK_MATTE_ALPHA;
+        return SPEAK_MATTE_OFF;
+    }
     void updateEnabledness()
     {
         const bool on = m_EnableTone->getValue();
@@ -270,10 +301,13 @@ private:
         m_WeaveAmount->setEnabled(optics); m_WeaveSpeed->setEnabled(optics);
         m_EnableOptics->setEnabled(true);
         // Grain is standalone (no spine required): gated on its own enable only,
-        // and the matte floor additionally on the matte toggle.
+        // and the matte floor additionally on a matte source being active
+        // (explicit or v0.3-legacy — the floor is live either way).
         const bool gr = m_EnableGrain->getValue();
-        m_GrainAmount->setEnabled(gr); m_GrainSize->setEnabled(gr); m_GrainMatte->setEnabled(gr);
-        m_GrainMatteFloor->setEnabled(gr && m_GrainMatte->getValue());
+        int ms = 0; m_MatteSource->getValue(ms);
+        m_GrainAmount->setEnabled(gr); m_GrainSize->setEnabled(gr);
+        m_MatteSource->setEnabled(gr);
+        m_GrainMatteFloor->setEnabled(gr && (ms != SPEAK_MATTE_OFF || m_GrainMatte->getValue()));
     }
 
     SpeakParams gatherParams(double t)
@@ -339,9 +373,13 @@ private:
         prof.halThresh = static_cast<float>(m_HalThresh->getValueAtTime(t));
 
         // Grain (Phase 4): density-domain emulsion noise, optionally keyed on
-        // the incoming alpha (Hush's clean-confidence matte).
+        // Hush's clean-confidence matte. matteSource / matteKeyMissing / the
+        // status strip are resolved in setupAndProcess — they need the clip
+        // connection state and the frame, which this function never touches.
         p.enableGrain      = m_EnableGrain->getValueAtTime(t) ? 1 : 0;
-        p.grainMatte       = m_GrainMatte->getValueAtTime(t) ? 1 : 0;
+        p.matteSource      = SPEAK_MATTE_OFF;
+        p.matteKeyMissing  = 0;
+        p.statusStrip      = m_StatusStrip->getValueAtTime(t) ? 1 : 0;
         p.grainMatteFloor  = static_cast<float>(m_GrainMatteFloor->getValueAtTime(t));
         prof.grainAmount   = static_cast<float>(m_GrainAmount->getValueAtTime(t));
         prof.grainSize     = static_cast<float>(m_GrainSize->getValueAtTime(t));
@@ -371,27 +409,44 @@ private:
 
         SpeakParams params = gatherParams(t);
 
-        // v0.3: the blue-wire matte. When Use Incoming Matte is on and the node's
-        // KEY input is connected, pack the mask value into a contiguous src copy's
-        // ALPHA — the exact channel the kernels already key grain on — so no
-        // grain-code change is needed. maskExternal then forces the OUTPUT alpha
-        // opaque inside the kernels, so the matte never rides Speak's own output
-        // and Resolve can't unpremultiply (blow out) Speak's node the way a
-        // fractional pass-through alpha would.
+        // The matte source, resolved (SPEC-1.0 §1). KEY packs the mask clip
+        // into a contiguous src copy's ALPHA — the exact channel the kernels
+        // key grain on — so the grain code has ONE path. A selected-but-
+        // unwired key sets matteKeyMissing: the matte reads as 0 (absence
+        // means absence, grain at the Floor) instead of v0.3's silent slide
+        // onto the incoming alpha, which on the color page is opaque and blew
+        // grain to full strength everywhere.
+        const int eff = effectiveMatteSource(t);
+        const bool keyConnected = m_MaskClip && m_MaskClip->isConnected();
+        params.matteSource     = eff;
+        params.matteKeyMissing = (eff == SPEAK_MATTE_KEY && !keyConnected) ? 1 : 0;
         std::unique_ptr<OFX::Image> mask;
         std::vector<float> srcCopy;
-        const bool useMask = m_GrainMatte->getValueAtTime(t) && m_MaskClip &&
-                             m_MaskClip->isConnected();
-        if (useMask) {
+        if (eff == SPEAK_MATTE_KEY && keyConnected) {
             mask.reset(m_MaskClip->fetchImage(t));
             if (mask) srcCopy = packSrcWithMask(src.get(), mask.get(), p_Args.renderWindow);
         }
-        const bool injected = useMask && !srcCopy.empty();
-        // consume-on-use: whenever the matte drives grain — from the key wire
-        // OR the incoming alpha — Speak is the matte's consumer, and its
-        // output alpha goes opaque. A matte that keeps riding after its
-        // consumer is what host alpha math (unpremults, mixes) feeds on.
-        params.maskExternal = m_GrainMatte->getValueAtTime(t) ? 1 : 0;
+        const bool injected = !srcCopy.empty();
+        if (eff == SPEAK_MATTE_KEY && keyConnected && !injected)
+            params.matteKeyMissing = 1;   // key clip yielded no image: absence
+        // consume-on-use: whenever a matte source is active — key wire OR
+        // incoming alpha — Speak is the matte's consumer, and its output
+        // alpha goes opaque. A matte that keeps riding after its consumer is
+        // what host alpha math (unpremults, mixes) feeds on.
+        params.maskExternal = (eff != SPEAK_MATTE_OFF) ? 1 : 0;
+
+        // The status strip's text (SPEC-1.0 §2), composed HERE — the kernels
+        // rasterize, they never decide. The matte mean is measured on a
+        // stride-8 grid: cheap, and plenty for a two-decimal readout.
+        if (params.statusStrip) {
+            const float mean =
+                (eff == SPEAK_MATTE_KEY && injected) ? meanAlphaStride(srcCopy.data(), p_Args.renderWindow)
+              : (eff == SPEAK_MATTE_ALPHA)           ? meanSrcAlphaStride(src.get())
+              : 0.0f;
+            const bool legacy = m_GrainMatte->getValueAtTime(t);
+            speakcore::packStatusText(params,
+                composeStatus(params, eff, keyConnected, legacy, mean).c_str());
+        }
 
         const bool gpu = p_Args.isEnabledMetalRender || p_Args.isEnabledCudaRender || p_Args.isEnabledOpenCLRender;
         if (gpu) {
@@ -406,6 +461,80 @@ private:
         } else {
             renderCPU(src.get(), dst.get(), params, injected ? srcCopy.data() : nullptr);
         }
+    }
+
+    // Stride-8 mean of the packed buffer's alpha (the active matte). A status
+    // readout, not a measurement pass: two decimals is its whole job.
+    static float meanAlphaStride(const float* buf, const OfxRectI& win)
+    {
+        const int W = win.x2 - win.x1, H = win.y2 - win.y1;
+        double sum = 0.0; long n = 0;
+        for (int y = 0; y < H; y += 8)
+            for (int x = 0; x < W; x += 8) {
+                sum += buf[(static_cast<size_t>(y) * W + x) * 4 + 3]; ++n;
+            }
+        return n > 0 ? static_cast<float>(sum / n) : 0.0f;
+    }
+
+    static float meanSrcAlphaStride(OFX::Image* src)
+    {
+        const OfxRectI b = src->getBounds();
+        double sum = 0.0; long n = 0;
+        for (int y = b.y1; y < b.y2; y += 8)
+            for (int x = b.x1; x < b.x2; x += 8) {
+                const float* s = static_cast<float*>(src->getPixelAddress(x, y));
+                if (s) { sum += s[3]; ++n; }
+            }
+        return n > 0 ? static_cast<float>(sum / n) : 0.0f;
+    }
+
+    // The status line: active stages + matte source + its LIVE state. This
+    // strip is as much the §0 fix as the choice param is — the silent state
+    // (what drives grain, right now) becomes a stated one. Codes: \x01 check,
+    // \x02 middot, \x03 emdash, \x04 arrow (see the font in speak_core.h).
+    static std::string composeStatus(const SpeakParams& p, int eff,
+                                     bool keyConnected, bool legacy, float mean)
+    {
+        const SpeakProfile& pf = p.profile;
+        const bool toneOn  = p.enableTone != 0 && p.strength > 0.0f;
+        const bool dyeOn   = p.enableDye != 0 && speakcore::dyeActive(pf);
+        const bool splitOn = p.enableSplit != 0 && speakcore::splitActive(pf);
+        const bool grainOn = speakcore::grainActive(p);
+        const bool lightOn = p.enableOptics != 0 && p.strength > 0.0f &&
+                             (pf.bloomAmount > 0.0f || pf.vignAmount > 0.0f ||
+                              pf.weaveAmount > 0.0f ||
+                              (toneOn && pf.halAmount > 0.0f));
+        std::string s;
+        if (toneOn)  s += "2\x02tone ";
+        if (dyeOn)   s += "3\x02" "dye ";
+        if (splitOn) s += "4\x02split ";
+        if (lightOn) s += "5\x02light ";
+        if (grainOn) s += "6\x02grain ";
+        if (s.empty()) s = "no active stages ";
+        s += "| matte: ";
+        char buf[48];
+        if (eff == SPEAK_MATTE_OFF) {
+            s += grainOn ? "off \x03 grain uniform" : "off";
+        } else {
+            if (legacy) s += "v0.3 auto\x04";
+            if (eff == SPEAK_MATTE_KEY) {
+                if (!keyConnected) {
+                    s += "key not connected \x03 grain at floor";
+                } else {
+                    snprintf(buf, sizeof(buf), "key \x01 mean %.2f", mean);
+                    s += buf;
+                }
+            } else {
+                if (mean > 0.999f) {
+                    s += "incoming alpha is opaque \x03 is Hush's export on?";
+                } else {
+                    snprintf(buf, sizeof(buf), "incoming alpha, mean %.2f", mean);
+                    s += buf;
+                }
+            }
+            if (!grainOn) s += " (grain off)";
+        }
+        return s;
     }
 
     // Pack src RGB + the mask's matte (max of luma and alpha, robust to whether
@@ -512,11 +641,13 @@ private:
     OFX::BooleanParam* m_EnableGrain;
     OFX::DoubleParam*  m_GrainAmount;
     OFX::DoubleParam*  m_GrainSize;
-    OFX::BooleanParam* m_GrainMatte;
+    OFX::ChoiceParam*  m_MatteSource;
+    OFX::BooleanParam* m_GrainMatte;      // v0.3 legacy carrier, secret
     OFX::DoubleParam*  m_GrainMatteFloor;
     OFX::ChoiceParam*  m_ViewMode;
     OFX::BooleanParam* m_ScopeHD;
     OFX::BooleanParam* m_ScopeDensity;
+    OFX::BooleanParam* m_StatusStrip;
 };
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -817,7 +948,9 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
     // Standalone (no spine required): grain is the emulsion's own noise on
     // whatever image arrives. Density-domain, per dye layer, boils every frame.
     OFX::GroupParamDescriptor* grpGrain = p_Desc.defineGroupParam("grpGrain");
-    grpGrain->setLabels("6 \xC2\xB7 Grain", "6 \xC2\xB7 Grain", "6 \xC2\xB7 Grain");
+    grpGrain->setLabels("6 \xC2\xB7 Grain \xE2\x80\x94 where film lives",
+                        "6 \xC2\xB7 Grain \xE2\x80\x94 where film lives",
+                        "6 \xC2\xB7 Grain");
     grpGrain->setOpen(true);
     grpGrain->setHint("Film grain as DENSITY noise: the dye clouds are the image, so grain "
                       "multiplies light instead of adding video noise on top - shadows are loud, "
@@ -835,22 +968,50 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                "Grain pitch as a percentage of frame HEIGHT, so the physical size holds from "
                "proxy to full res. 0.10 is a fine 35mm-scan feel (~2px at UHD); bigger reads "
                "as faster, chunkier stock.", 0.10, 0.05, 0.60, 0.01, grpGrain);
-    sDefBool(p_Desc, page, "grainMatte", "Use Incoming Matte",
-             "Keys the grain on Hush's clean-confidence matte: full grain where the matte is 1, "
-             "the Floor where it is 0.\n\n"
-             "COLOR PAGE SETUP (the one true recipe):\n"
-             "  1. Hush node: Export Clean Matte to Alpha ON, then right-click the node -> "
-             "OFX Alpha -> Enable.\n"
-             "  2. Drag the BLUE key wire: Hush's key output -> THIS node's key input.\n"
-             "  3. Turn this on.\n"
-             "No key wired? It falls back to the incoming image alpha (Fusion-page in-band mode).\n\n"
-             "Either way, Speak CONSUMES the matte: its output alpha is forced opaque, so the "
-             "matte never rides further downstream where host alpha math could touch the "
-             "picture. Off = grain is uniform and alpha passes through untouched.",
-             false, grpGrain);
+    {
+        // v1.0 (SPEC-1.0 §1): the matte source is a CHOICE, never a fallback.
+        OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("matteSource");
+        c->setLabels("Matte Source", "Matte Source", "Matte");
+        c->setHint("What keys the grain on Hush's clean-confidence matte: full grain where "
+                   "the matte is 1, the Floor where it is 0.\n\n"
+                   "Off — grain is uniform; alpha passes through untouched.\n\n"
+                   "Key input — the BLUE key wire (the color-page recipe):\n"
+                   "  1. Hush node: Export Clean Matte to Alpha ON, then right-click the "
+                   "node -> OFX Alpha -> Enable.\n"
+                   "  2. Drag the blue wire: Hush's key output -> THIS node's key input.\n"
+                   "  3. Set this to Key input.\n"
+                   "No key wired? Grain holds at the Matte Floor — absence means absence; "
+                   "nothing silently substitutes. The status strip says so.\n\n"
+                   "Incoming alpha — reads the alpha riding the RGB connection instead "
+                   "(Fusion page / in-band workflows), by explicit choice only.\n\n"
+                   "Any active source is CONSUMED here: Speak's output alpha is forced "
+                   "opaque, so the matte never rides further downstream where host alpha "
+                   "math could touch the picture. See View -> Setup Guide.");
+        c->appendOption("Off");
+        c->appendOption("Key input (blue wire)");
+        c->appendOption("Incoming alpha (Fusion / in-band)");
+        c->setDefault(SPEAK_MATTE_OFF);
+        c->setParent(*grpGrain);
+        page->addChild(*c);
+    }
+    {
+        // The v0.3 bool, kept SECRET so old projects restore their value and
+        // the live migration in effectiveMatteSource can preserve renders.
+        // The first explicit Matte Source choice retires it (changedParam).
+        OFX::BooleanParamDescriptor* b = p_Desc.defineBooleanParam("grainMatte");
+        b->setLabels("Use Incoming Matte (v0.3)", "Use Incoming Matte (v0.3)",
+                     "Use Incoming Matte (v0.3)");
+        b->setScriptName("grainMatte");
+        b->setHint("Legacy v0.3 toggle, migrated to Matte Source. Not shown.");
+        b->setDefault(false);
+        b->setIsSecret(true);
+        b->setParent(*grpGrain);
+        page->addChild(*b);
+    }
     sDefDouble(p_Desc, page, "grainMatteFloor", "Matte Floor",
                "Grain amount where the matte is 0 (protected motion). The real noise is still "
-               "there, so a little added grain usually blends better than none.",
+               "there, so a little added grain usually blends better than none. Also the "
+               "grain level everywhere when Key input is selected but no key is wired.",
                0.35, 0.0, 1.0, 0.01, grpGrain);
 
     // -------------------------------------------------------------- 6 · Inspect
@@ -872,10 +1033,20 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
         c->appendOption("Halation Scatter (isolated)");
         c->appendOption("Grain (isolated, on gray)");
         c->appendOption("Bloom (isolated, signed, on gray)");
+        c->appendOption("Setup Guide (the Hush handoff)");
         c->setDefault(SPEAK_VIEW_RESULT);
         c->setParent(*grpInspect);
         page->addChild(*c);
     }
+    sDefBool(p_Desc, page, "statusStrip", "Status Strip",
+             "One line at the bottom-left of the frame: the active stages, the matte "
+             "source and its LIVE state (key wired or not, matte mean, opaque-alpha "
+             "warning). Drawn by the render kernel itself, so it can never disagree "
+             "with the pixels — and burned into the frame like the scopes, so TURN "
+             "IT OFF BEFORE DELIVERING. On by default because the silent state was "
+             "the trap: a matte that wasn't arriving looked exactly like one that "
+             "was. It draws nothing while Speak is bit-exact identity.",
+             true, grpInspect);
     sDefBool(p_Desc, page, "scopeHD", "Scope: H&D Curves",
              "Draws the applied per-channel characteristic curves in the viewer (top-left) with "
              "this frame's exposure histogram on the logE axis — the exact curve the pixels use, "

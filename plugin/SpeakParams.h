@@ -151,6 +151,15 @@ typedef struct SpeakProfile
 #define SPEAK_VIEW_SCATTER        3   // the isolated halation scatter field
 #define SPEAK_VIEW_GRAIN          4   // gray + the grain increment, isolated
 #define SPEAK_VIEW_BLOOM          5   // gray + the SIGNED bloom delta, isolated
+#define SPEAK_VIEW_SETUP          6   // the Setup Guide card (v1.0) — the
+                                      // Hush->Speak recipe drawn by the kernel
+
+// matteSource values (v1.0 — replaces the v0.3 grainMatte bool; see §1 of
+// docs/SPEC-1.0.md). The value here is the EFFECTIVE source: the plugin
+// resolves the legacy v0.3 bool into one of these before the kernel runs.
+#define SPEAK_MATTE_OFF           0   // grain uniform, alpha untouched
+#define SPEAK_MATTE_KEY           1   // the Matte clip (blue key wire)
+#define SPEAK_MATTE_ALPHA         2   // the incoming image alpha (in-band)
 
 typedef struct SpeakParams
 {
@@ -174,13 +183,33 @@ typedef struct SpeakParams
 
     // ---- grain pipeline controls (NOT stock properties, so params-level) ----
     int   enableGrain;     // the grain stage's own toggle
-    int   grainMatte;      // 1 = key grain on the INCOMING ALPHA (Hush's clean-
+    int   matteSource;     // SPEAK_MATTE_* — the EFFECTIVE matte source (v1.0).
+                           // With KEY the plugin packs the key clip into the
+                           // src alpha the kernels read; with ALPHA the source
+                           // buffer's own alpha is the matte (Hush's clean-
                            // confidence matte: clamp((effN-1)/6), high = cleaned)
     float grainMatteFloor; // grain amount where the matte is 0 (motion) — the
                            // real noise is still there, so add less on top
+    int   matteKeyMissing; // 1 = KEY selected but no key wired: the matte reads
+                           // as 0 everywhere (absence means absence — grain sits
+                           // at the Floor; the silent fall-through to incoming
+                           // alpha was v0.3's color-page trap, see SPEC-1.0 §0)
+
+    // ---- on-image guidance (v1.0, SPEC-1.0 §2) ----
+    // The one-line status strip is drawn by the kernels from TEXT COMPOSED BY
+    // THE PLUGIN — message logic lives once in C++; the kernels only share a
+    // rasterizer (and its font table, re-declared per backend like everything
+    // else). Packed 4 chars per int, little-endian byte order, NUL-terminated.
+    // Codes 1..15 are the font's specials (check, middot, emdash, arrow, and
+    // the box-drawing set); see kSpeakFontBits in speak_core.h.
+    int   statusStrip;     // 1 = draw the strip (bottom-left, panel chrome)
+    int   statusText[28];  // up to 111 chars + NUL, packed 4-per-int
 
     SpeakProfile profile;
-    int   maskExternal;    // v0.3: 1 = external key (blue) wired; output alpha forced opaque
+    int   maskExternal;    // consume-on-use: 1 = a matte source is active, so
+                           // Speak is the matte's consumer and the OUTPUT alpha
+                           // is forced opaque (a matte that keeps riding past
+                           // its consumer is what host alpha math feeds on)
 } SpeakParams;
 
 // ---------------------------------------------------------------------------

@@ -272,7 +272,7 @@ int main()
       p.profile.grainSize = 0.45f; p.frameIndex = 12;
       run(W, H, p, "grain coarse 0.45%", 0); }
     { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
-      p.grainMatte = 1; p.grainMatteFloor = 0.3f; p.frameIndex = 12;
+      p.matteSource = SPEAK_MATTE_ALPHA; p.grainMatteFloor = 0.3f; p.frameIndex = 12;
       run(W, H, p, "grain + alpha-ramp matte", 0); }
     { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
       p.viewMode = SPEAK_VIEW_GRAIN; p.frameIndex = 12;
@@ -280,8 +280,19 @@ int main()
     { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.5f;
       p.strength = 0.0f; p.enableTone = 0;
       run(W, H, p, "grain standalone (no spine)", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.matteSource = SPEAK_MATTE_KEY; p.matteKeyMissing = 1; p.grainMatteFloor = 0.35f;
+      p.frameIndex = 12;
+      run(W, H, p, "grain, key selected but unwired (floor)", 0); }
+    { SpeakParams p = baseParams(); p.enableGrain = 1; p.profile.grainAmount = 0.7f;
+      p.statusStrip = 1; p.frameIndex = 12;
+      speakcore::packStatusText(p, "6\x02grain | matte: key \x01 mean 0.31");
+      run(W, H, p, "status strip raster", 0); }
+    { SpeakParams p = baseParams(); p.viewMode = SPEAK_VIEW_SETUP; p.statusStrip = 1;
+      speakcore::packStatusText(p, "matte: key not connected \x03 grain at floor");
+      run(W, H, p, "setup guide card + strip", 0); }
     { SpeakParams p = halParams(); p.enableGrain = 1; p.profile.grainAmount = 0.6f;
-      p.grainMatte = 1; p.grainMatteFloor = 0.35f;
+      p.matteSource = SPEAK_MATTE_ALPHA; p.grainMatteFloor = 0.35f;
       runHot(W, H, p, "halation + grain + matte", 0); }
 
     /* ---- bloom: its own pyramid on the LOOK's output (mirrors the Metal
