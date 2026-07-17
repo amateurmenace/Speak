@@ -93,6 +93,32 @@ typedef struct SpeakProfile
     float grainAmount;    // 0 = off (bit-exact identity)
     float grainSize;      // grain pitch as % of FRAME HEIGHT (format-relative)
 
+    // ---- Bloom / veiling glare (Phase 4, spec 1B.5) ----
+    // Optical glare on the VIEWED image, sited in linear after the print: an
+    // energy-conserving convex mix toward a normalized multi-scale scatter of
+    // the finished look's linear light (a lens transmits — it creates
+    // nothing), plus a veiling floor carried as a frame-MEAN term in the same
+    // normalized mixture, so the black-lift scales with frame luminance
+    // exactly. See speak_core.h for the physics and the gates.
+    float bloomAmount;    // 0 = off (bit-exact identity); the scattered fraction
+    float bloomRadius;    // scatter radius as % of FRAME HEIGHT (format-relative)
+    float bloomVeil;      // veiling floor's share of the scattered light [0..0.9]
+
+    // ---- Vignette (Phase 4) ----
+    // cos^4 natural illumination falloff of the TAKING lens (the published
+    // cosine-fourth law), applied to scene-linear BEFORE the negative — so
+    // corners ride down the H&D toe the way film corners actually do, and
+    // light that never arrived cannot halate. See speak_core.h vignGain.
+    float vignAmount;     // 0 = off (bit-exact identity); mix toward cos^4
+    float vignField;      // half-DIAGONAL field angle, degrees (lens FOV knob)
+
+    // ---- Gate weave (Phase 4) ----
+    // The transport's picture-position noise: a deterministic closed form of
+    // frameIndex (hash-lattice octaves, ~1/f spectrum), resampled sub-pixel
+    // with Catmull-Rom. Same frame in, same frame out — always, everywhere.
+    float weaveAmount;    // 0 = off (bit-exact identity); amplitude, % of height
+    float weaveSpeed;     // temporal scale of the weave pattern (1 = default)
+
     // ---- meta ----
     float systemGamma;    // target overall system gamma (~1.6), for the scope
     int   residualLUT;    // 0 = separable model only, 1 = 3D residual cube on
@@ -124,6 +150,7 @@ typedef struct SpeakProfile
 #define SPEAK_VIEW_INPUT          2
 #define SPEAK_VIEW_SCATTER        3   // the isolated halation scatter field
 #define SPEAK_VIEW_GRAIN          4   // gray + the grain increment, isolated
+#define SPEAK_VIEW_BLOOM          5   // gray + the SIGNED bloom delta, isolated
 
 typedef struct SpeakParams
 {
@@ -183,10 +210,16 @@ typedef struct SpeakParams
 #define SPEAK_STATS_UINTS    (129 + 36864 + 1)
 
 // ---------------------------------------------------------------------------
-// The shared separable scatter pyramid (Phase 4). One energy-normalized pyramid
-// is built on the per-channel scene-linear highlight excess and read back at
-// full resolution as a weighted mixture of octave levels. Halation reads it
-// today; bloom will read the SAME pyramid with broader weights (spec 1B.5).
+// The shared separable scatter pyramid (Phase 4). An energy-normalized pyramid
+// read back at full resolution as a weighted mixture of octave levels. The
+// same machinery runs twice when both optics modules are live: halation
+// builds it on the SCENE-linear highlight excess (pre-curve — the light that
+// re-exposes the negative), bloom on the LOOK's linear output (post-print —
+// the light the viewer's optics scatter). Spec 1B.5's "read the same pyramid
+// twice" could not survive the halation injection-site physics: the two
+// fields live on opposite sides of the tone scale, and an energy-conserving
+// bloom must subtract light in the same domain where it re-adds it. What is
+// shared is the machinery (decimate/accumulate/sample), textually.
 //
 // WHY A PYRAMID, MEASURED (not assumed — this repo builds no architecture
 // without a measurement). Metal, UHD 3840x2160, 3 channels, per frame:

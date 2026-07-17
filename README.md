@@ -65,8 +65,10 @@ Grab the latest release from [Releases](../../releases) or the shared
   `/Library/OFX/Plugins`. If Resolve doesn't see it, delete
   `~/Library/Application Support/Blackmagic Design/DaVinci Resolve/OFXPluginCacheV2.xml`
   and relaunch.
-- **Windows/Linux** — build from source for now (`plugin/Makefile`); prebuilt
-  zips follow once CI artifacts are wired for this repo.
+- **Windows** — CI now builds a prebuilt zip (`Speak-<version>-Windows.zip`,
+  OpenCL render path) on every push; it attaches to releases from the next
+  one on. Until then, or on Linux: build from source (`plugin/Makefile`,
+  Windows: `CMakeLists.txt`).
 
 In Resolve: last node → OpenFX → **Hush → Speak Film**. On a DaVinci Wide
 Gamut / Intermediate managed timeline, leave Output on *Working space* and let

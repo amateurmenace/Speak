@@ -284,6 +284,70 @@ int main()
       p.grainMatte = 1; p.grainMatteFloor = 0.35f;
       runHot(W, H, p, "halation + grain + matte", 0); }
 
+    /* ---- bloom: its own pyramid on the LOOK's output (mirrors the Metal
+       suite's cases). The hot frame's disc + saturated blue lamp are the
+       teeth — a GPU that skipped the bloom passes renders no halo and no
+       source-borrow, and fails loud. The whole chain (look -> decimate ->
+       mean -> accum -> normalize) is atomics-free, so it runs everywhere;
+       only the parade case needs the stats pass. ---- */
+    { SpeakParams p = halParams(); p.profile.halAmount = 0.0f; p.profile.bloomAmount = 0.0f;
+      runHot(W, H, p, "bloom amount 0 (skip path)", 0); }
+    { SpeakParams p = halParams(); p.profile.halAmount = 0.0f;
+      p.profile.bloomAmount = 0.6f; p.profile.bloomRadius = 3.0f; p.profile.bloomVeil = 0.0f;
+      runHot(W, H, p, "bloom s0.6 r3 no veil", 0); }
+    { SpeakParams p = halParams(); p.profile.halAmount = 0.0f;
+      p.profile.bloomAmount = 0.6f; p.profile.bloomRadius = 8.0f; p.profile.bloomVeil = 0.5f;
+      runHot(W, H, p, "bloom wide + veil 0.5", 0); }
+    { SpeakParams p = halParams(); p.profile.halAmount = 0.0f;
+      p.profile.bloomAmount = 0.8f; p.profile.bloomVeil = 0.25f; p.viewMode = SPEAK_VIEW_BLOOM;
+      runHot(W, H, p, "bloom isolated (signed) view", 0); }
+
+    /* ---- vignette: cos^4 pre-curve gain, per-pixel pure, atomics-free ---- */
+    { SpeakParams p = baseParams(); p.enableOptics = 1; p.profile.vignAmount = 0.0f;
+      run(W, H, p, "vignette amount 0 (skip path)", 0); }
+    { SpeakParams p = baseParams(); p.profile = stockProfile(); p.enableOptics = 1;
+      p.profile.vignAmount = 0.9f; p.profile.vignField = 35.0f;
+      run(W, H, p, "vignette 0.9 field 35 + stock", 0); }
+    { SpeakParams p = halParams(); p.profile.vignAmount = 1.0f; p.profile.vignField = 40.0f;
+      runHot(W, H, p, "vignette + halation (corners)", 0); }
+
+    /* ---- gate weave: host-computed displacement + the Catmull-Rom resample
+       (pre-copy + weave kernels). Deterministic, atomics-free. ---- */
+    { SpeakParams p = baseParams(); p.enableOptics = 1; p.profile.weaveAmount = 0.0f;
+      run(W, H, p, "weave amount 0 (skip path)", 0); }
+    { SpeakParams p = baseParams(); p.profile = stockProfile(); p.enableOptics = 1;
+      p.profile.weaveAmount = 0.4f; p.frameIndex = 137;
+      run(W, H, p, "weave 0.4% frame 137", 0); }
+    { SpeakParams p = baseParams(); p.profile = stockProfile(); p.enableOptics = 1;
+      p.profile.weaveAmount = 0.4f; p.frameIndex = 138;
+      run(W, H, p, "weave next frame (wanders)", 0); }
+
+    /* The everything case: all Phase-4 optics live at once, odd dims. No
+       scope, so it runs on broken-atomics devices too — which makes it the
+       one case that exercises the halation->bloom arena reuse everywhere. */
+    { SpeakParams p = halParams(); p.profile.halAmount = 0.8f; p.profile.halRadius = 1.5f;
+      p.enableGrain = 1; p.profile.grainAmount = 0.5f;
+      p.profile.bloomAmount = 0.4f; p.profile.bloomVeil = 0.15f;
+      p.profile.vignAmount = 0.7f; p.profile.weaveAmount = 0.3f; p.frameIndex = 41;
+      runHot(353, 225, p, "everything at once, 353x225", 0); }
+
+    if (atomicsOK) {
+        /* The parade must measure the BLOOMED (and grained, halated) result,
+           and the weave must NOT move the panel chrome — both read the stats
+           pass, so they gate on the atomics probe like every scope case. */
+        { SpeakParams p = halParams(); p.profile.halAmount = 0.9f; p.profile.halRadius = 1.5f;
+          p.profile.bloomAmount = 0.5f; p.profile.bloomVeil = 0.2f;
+          p.enableGrain = 1; p.profile.grainAmount = 0.4f; p.frameIndex = 12;
+          p.scopeDensity = 1;
+          runHot(W, H, p, "halation + grain + bloom + parade", 1); }
+        { SpeakParams p = baseParams(); p.profile = stockProfile(); p.enableOptics = 1;
+          p.profile.weaveAmount = 0.4f; p.frameIndex = 137;
+          p.scopeHD = 1; p.scopeDensity = 1;
+          run(W, H, p, "weave + scopes (chrome pinned)", 1); }
+    } else {
+        printf("  [SKIP] bloom parade / weave+scopes   (device's OpenCL atomics are broken)\n");
+    }
+
     printf("\n%s (%d failures)\n", g_fail ? "PARITY FAILED" : "PARITY GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

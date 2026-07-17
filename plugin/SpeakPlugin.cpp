@@ -145,6 +145,13 @@ public:
         m_HalAmount     = fetchDoubleParam("halAmount");
         m_HalRadius     = fetchDoubleParam("halRadius");
         m_HalThresh     = fetchDoubleParam("halThresh");
+        m_BloomAmount   = fetchDoubleParam("bloomAmount");
+        m_BloomRadius   = fetchDoubleParam("bloomRadius");
+        m_BloomVeil     = fetchDoubleParam("bloomVeil");
+        m_VignAmount    = fetchDoubleParam("vignAmount");
+        m_VignField     = fetchDoubleParam("vignField");
+        m_WeaveAmount   = fetchDoubleParam("weaveAmount");
+        m_WeaveSpeed    = fetchDoubleParam("weaveSpeed");
         m_EnableGrain   = fetchBooleanParam("enableGrain");
         m_GrainAmount   = fetchDoubleParam("grainAmount");
         m_GrainSize     = fetchDoubleParam("grainSize");
@@ -225,9 +232,18 @@ private:
         // Gated on the ENABLE toggles only, never on Strength's value — that
         // matches every other group here and lets a user dial halation in before
         // bringing Strength up.
-        const bool op = m_EnableOptics->getValue() && m_EnableTone->getValue();
+        // ...but only HALATION carries that requirement. Bloom, vignette and
+        // gate weave act on light and picture the spine never touches, so
+        // they follow enableOptics alone — greying them under tone-off would
+        // disable controls that genuinely work.
+        const bool optics = m_EnableOptics->getValue();
+        const bool op = optics && m_EnableTone->getValue();
         m_HalAmount->setEnabled(op); m_HalRadius->setEnabled(op); m_HalThresh->setEnabled(op);
-        m_EnableOptics->setEnabled(m_EnableTone->getValue());
+        m_BloomAmount->setEnabled(optics); m_BloomRadius->setEnabled(optics);
+        m_BloomVeil->setEnabled(optics);
+        m_VignAmount->setEnabled(optics); m_VignField->setEnabled(optics);
+        m_WeaveAmount->setEnabled(optics); m_WeaveSpeed->setEnabled(optics);
+        m_EnableOptics->setEnabled(true);
         // Grain is standalone (no spine required): gated on its own enable only,
         // and the matte floor additionally on the matte toggle.
         const bool gr = m_EnableGrain->getValue();
@@ -304,6 +320,15 @@ private:
         p.grainMatteFloor  = static_cast<float>(m_GrainMatteFloor->getValueAtTime(t));
         prof.grainAmount   = static_cast<float>(m_GrainAmount->getValueAtTime(t));
         prof.grainSize     = static_cast<float>(m_GrainSize->getValueAtTime(t));
+        // Phase 4 optics, the rest: lens glare (bloom+veil, after the print),
+        // cos^4 vignette (before the negative), and the gate's weave.
+        prof.bloomAmount   = static_cast<float>(m_BloomAmount->getValueAtTime(t));
+        prof.bloomRadius   = static_cast<float>(m_BloomRadius->getValueAtTime(t));
+        prof.bloomVeil     = static_cast<float>(m_BloomVeil->getValueAtTime(t));
+        prof.vignAmount    = static_cast<float>(m_VignAmount->getValueAtTime(t));
+        prof.vignField     = static_cast<float>(m_VignField->getValueAtTime(t));
+        prof.weaveAmount   = static_cast<float>(m_WeaveAmount->getValueAtTime(t));
+        prof.weaveSpeed    = static_cast<float>(m_WeaveSpeed->getValueAtTime(t));
 
         p.profile = prof;
         return p;
@@ -392,6 +417,13 @@ private:
     OFX::DoubleParam*  m_HalAmount;
     OFX::DoubleParam*  m_HalRadius;
     OFX::DoubleParam*  m_HalThresh;
+    OFX::DoubleParam*  m_BloomAmount;
+    OFX::DoubleParam*  m_BloomRadius;
+    OFX::DoubleParam*  m_BloomVeil;
+    OFX::DoubleParam*  m_VignAmount;
+    OFX::DoubleParam*  m_VignField;
+    OFX::DoubleParam*  m_WeaveAmount;
+    OFX::DoubleParam*  m_WeaveSpeed;
     OFX::BooleanParam* m_EnableGrain;
     OFX::DoubleParam*  m_GrainAmount;
     OFX::DoubleParam*  m_GrainSize;
@@ -618,15 +650,17 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
     OFX::GroupParamDescriptor* grpLight = p_Desc.defineGroupParam("grpLight");
     grpLight->setLabels("5 \xC2\xB7 Light", "5 \xC2\xB7 Light", "5 \xC2\xB7 Light");
     grpLight->setOpen(true);
-    grpLight->setHint("Light scattering in the film itself. Halation is light that passed through "
-                      "the emulsion, bounced off the base and re-exposed the negative from behind — "
-                      "so it is added as exposure before the curve, and the print's shoulder is what "
-                      "makes the halo bloom white-hot instead of glowing pure red. Needs Film Tone "
-                      "on: with no negative there is nothing to re-expose. Set View to Halation "
-                      "Scatter to see the light it is adding, on its own.");
+    grpLight->setHint("The optical path around the emulsion, end to end. Vignette is the taking "
+                      "lens's cos^4 falloff on the light ENTERING the negative; halation is light "
+                      "that bounced off the film base and re-exposed the negative from behind "
+                      "(that one needs Film Tone on — no negative, nothing to re-expose); bloom "
+                      "and its veiling floor are glare in the viewing optics AFTER the print, "
+                      "energy-conserving by construction; gate weave is the transport's "
+                      "sub-pixel picture wander. The isolated Views show exactly what each adds.");
 
     sDefBool(p_Desc, page, "enableOptics", "Enable Light",
-             "Toggle halation to compare against the same grade without it.", false, grpLight);
+             "Toggle the whole optical group (vignette, halation, bloom, gate weave) to "
+             "compare against the same grade without it.", false, grpLight);
     sDefDouble(p_Desc, page, "halAmount", "Halation",
                "How much scattered light re-exposes the negative. 0 is off and is bit-exact "
                "identity — the whole scatter pass is skipped. Raise for the red bloom around "
@@ -636,6 +670,44 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                "scale on a proxy and at full res. Around 1% is the order of real 35mm "
                "base-reflection geometry; it is a starting point, not a measured stock.",
                1.0, 0.05, 8.0, 0.01, grpLight);
+    sDefDouble(p_Desc, page, "bloomAmount", "Bloom",
+               "Glare in the viewing optics, AFTER the print: an energy-conserving mix — the "
+               "halo's light is borrowed from the highlight, never invented (total linear "
+               "energy is preserved; that is a gate, not a wish). Spectrally neutral: a blue "
+               "neon blooms blue, where halation glows red. 0 = off, bit-exact.",
+               0.0, 0.0, 1.0, 0.01, grpLight);
+    sDefDouble(p_Desc, page, "bloomRadius", "Bloom Radius",
+               "Scatter radius as a percentage of frame HEIGHT (holds its scale from proxy to "
+               "full res). Wider than halation by nature — glare comes from the whole optical "
+               "train. The default is a modelled clean-projection value, not a measured lens.",
+               4.0, 0.1, 16.0, 0.01, grpLight);
+    sDefDouble(p_Desc, page, "bloomVeil", "Veiling Floor",
+               "The far-field share of the scattered light: a uniform lift that scales with the "
+               "frame's own luminance (the published veiling-glare behaviour of camera optics). "
+               "Raising it trades halo for floor — the total stays conserved.",
+               0.10, 0.0, 0.9, 0.01, grpLight);
+    sDefDouble(p_Desc, page, "vignAmount", "Vignette",
+               "Natural cos^4 illumination falloff of the taking lens, applied to the light "
+               "BEFORE the negative — corners ride down the film toe (contrast and color shift "
+               "like film, not like a darkened overlay), and vignetted light no longer halates. "
+               "Mixes toward the cos^4 floor only; mechanical (hood/filter) vignetting is not "
+               "modelled. 0 = off, bit-exact.",
+               0.0, 0.0, 1.0, 0.01, grpLight);
+    sDefDouble(p_Desc, page, "vignField", "Vignette Field Angle",
+               "Half-diagonal field of view in degrees — the lens this pretends to be. 27 is "
+               "about a normal lens; wider angles fall off harder. A modelled default, not a "
+               "measured lens.",
+               27.0, 5.0, 60.0, 0.1, grpLight);
+    sDefDouble(p_Desc, page, "weaveAmount", "Gate Weave",
+               "The transport's picture-position wander, as a percentage of frame height "
+               "(0.05 is about half a pixel at 1080p). A deterministic function of the frame "
+               "number — scrubbing repeats exactly, renders are identical everywhere. Result "
+               "view only; diagnostic views hold still. 0 = off, bit-exact.",
+               0.0, 0.0, 0.5, 0.005, grpLight);
+    sDefDouble(p_Desc, page, "weaveSpeed", "Weave Speed",
+               "Time scale of the weave pattern. 1 = the modelled default transport; higher "
+               "is a nervier gate, lower a lazier one.",
+               1.0, 0.1, 4.0, 0.01, grpLight);
     sDefDouble(p_Desc, page, "halThresh", "Halation Threshold",
                "Scene-linear level above which light scatters. This is a practical control for "
                "keeping the effect in the highlights, not a property of film — real emulsion "
@@ -690,6 +762,7 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
         c->appendOption("Input (Original)");
         c->appendOption("Halation Scatter (isolated)");
         c->appendOption("Grain (isolated, on gray)");
+        c->appendOption("Bloom (isolated, signed, on gray)");
         c->setDefault(SPEAK_VIEW_RESULT);
         c->setParent(*grpInspect);
         page->addChild(*c);

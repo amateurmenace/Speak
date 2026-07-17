@@ -27,6 +27,9 @@ typedef struct SpeakProfile
     float splitShadow[3]; float splitHigh[3]; float splitPivot; float splitBalance;
     float halAmount;    float halRadius;   float halThresh;
     float grainAmount;  float grainSize;
+    float bloomAmount;  float bloomRadius; float bloomVeil;
+    float vignAmount;   float vignField;
+    float weaveAmount;  float weaveSpeed;
     float systemGamma;  int residualLUT;    int profileVersion; int _pad0;
 } SpeakProfile;
 
@@ -281,14 +284,16 @@ inline void halLevelInfo(int W, int H, int L, thread int& lw, thread int& lh, th
 }
 
 constant float kHalSigmaC   = 0.645497f;
-constant float kHalCoreFall  = 3.0f;
-constant float kHalSkirtFall = 1.0f;
-inline float halLevelWeight(int L, float sigmaTarget)
+// Fall rates are ARGUMENTS, passed from the host (kHostHalCoreFall etc.):
+// halation and bloom share the pyramid machinery with different profiles
+// (speak_core.h). No in-kernel fall constants exist on purpose — a constant
+// here that nothing reads would be a knob that cannot fire.
+inline float halLevelWeight(int L, float sigmaTarget, float coreFall, float skirtFall)
 {
     float s = sigmaTarget < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : sigmaTarget;
     float Lt = log2(s / kHalSigmaC);
     float d = float(L) - Lt;
-    return (d <= 0.0f) ? exp2(kHalCoreFall * d) : exp2(-kHalSkirtFall * d);
+    return (d <= 0.0f) ? exp2(coreFall * d) : exp2(-skirtFall * d);
 }
 
 inline float halFetch(device const float* arena, int off, int lw, int lh, int x, int y, int c)
@@ -346,10 +351,10 @@ inline float halSampleLevel(device const float* arena, int off, int lw, int lh,
 
 // The mixture's total weight — the normalizer that makes the pyramid
 // energy-preserving. Same loop as speak_core.h on every backend.
-inline float halWeightSum(int nLev, float sigmaTarget)
+inline float halWeightSum(int nLev, float sigmaTarget, float coreFall, float skirtFall)
 {
     float wsum = 0.0f;
-    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget);
+    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget, coreFall, skirtFall);
     return wsum;
 }
 
@@ -375,11 +380,12 @@ inline float halWeightSum(int nLev, float sigmaTarget)
 // The host computes them with the same halLevelInfo, so the two agree by
 // construction. `sigmaTarget` stays in-kernel so it cannot drift from the
 // normalize pass.
-struct HalAccum { int lw, lh, off, cw, ch, coff, L, nLev; };
+struct HalAccum { int lw, lh, off, cw, ch, coff, L, nLev;
+                  float coreFall, skirtFall; int isBloom, _pad; };
 inline void halAccumPixel(device const float* arena, constant HalAccum& lv,
                           float sigmaTarget, int x, int y, thread float* out)
 {
-    float wl = halLevelWeight(lv.L, sigmaTarget);
+    float wl = halLevelWeight(lv.L, sigmaTarget, lv.coreFall, lv.skirtFall);
     if (lv.L >= lv.nLev - 1) {                 // the coarsest level: nothing above it
         for (int c = 0; c < 3; ++c) out[c] = wl * halFetch(arena, lv.off, lv.lw, lv.lh, x, y, c);
         return;
@@ -393,13 +399,14 @@ inline void halAccumPixel(device const float* arena, constant HalAccum& lv,
 
 inline void lookLinear(float r, float g, float b,
                        float scatR, float scatG, float scatB,
+                       float vgain,
                        constant SpeakParams& pr,
                        thread float& oR, thread float& oG, thread float& oB)
 {
     int cs = pr.inputColorSpace;
-    float lr = decodeToLinear(cs, r);
-    float lg = decodeToLinear(cs, g);
-    float lb = decodeToLinear(cs, b);
+    float lr = vgain * decodeToLinear(cs, r);
+    float lg = vgain * decodeToLinear(cs, g);
+    float lb = vgain * decodeToLinear(cs, b);
     float mr = lr, mg = lg, mb = lb;
     if ((pr.enableTone != 0) && (pr.strength > 0.0f)) {
         float s = clampf(pr.strength, 0.0f, 1.0f);
@@ -484,6 +491,88 @@ inline void applyGrain(thread float& r, thread float& g, thread float& b, float 
         float sigmaD = a * sqrt(Dc);
         float n = grainBand(fx, fy, sz, fr, uint(c));
         *ch = pow10f(-(D + sigmaD * n));
+    }
+}
+
+// ---- VIGNETTE (Phase 4) — cos^4, pre-curve; see speak_core.h ----
+inline bool vignActive(constant SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) && (pr.strength > 0.0f)
+        && (pr.profile.vignAmount > 0.0f);
+}
+inline float vignGain(int x, int y, int W, int H, constant SpeakParams& pr)
+{
+    if (!vignActive(pr)) return 1.0f;
+    float a = clampf(pr.profile.vignAmount, 0.0f, 1.0f)
+            * clampf(pr.strength, 0.0f, 1.0f);
+    float cx = 0.5f * float(W - 1);
+    float cy = 0.5f * float(H - 1);
+    float dx = float(x) - cx, dy = float(y) - cy;
+    float rhd2 = cx * cx + cy * cy;
+    float r2 = (dx * dx + dy * dy) / (rhd2 > 0.0f ? rhd2 : 1.0f);
+    float tanm = tan(pr.profile.vignField * 0.017453293f);
+    float c2 = 1.0f / (1.0f + r2 * tanm * tanm);
+    return lerpf(1.0f, c2 * c2, a);
+}
+
+// ---- BLOOM (Phase 4) — energy-conserving glare; see speak_core.h ----
+inline float bloomAmountOf(constant SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) ? clampf(pr.profile.bloomAmount, 0.0f, 1.0f) : 0.0f;
+}
+inline bool bloomActive(constant SpeakParams& pr)
+{
+    return (pr.strength > 0.0f) && (bloomAmountOf(pr) > 0.0f);
+}
+inline float bloomSigmaPx(int H, constant SpeakParams& pr)
+{
+    float s = pr.profile.bloomRadius * 0.01f * float(H);
+    return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
+}
+inline void bloomApplyPixel(thread float& r, thread float& g, thread float& b,
+                            float sR, float sG, float sB,
+                            constant SpeakParams& pr)
+{
+    if (!bloomActive(pr)) return;
+    float a = bloomAmountOf(pr) * clampf(pr.strength, 0.0f, 1.0f);
+    r = lerpf(r, sR, a);
+    g = lerpf(g, sG, a);
+    b = lerpf(b, sB, a);
+}
+
+// ---- GATE WEAVE sampling (Phase 4) — Catmull-Rom, see speak_core.h.
+// (The frame's displacement is computed HOST-side by the same speak_core
+// closed form and passed in — it is frame-uniform.)
+inline void weaveCRw(float t, thread float* w)
+{
+    float t2 = t * t, t3 = t2 * t;
+    w[0] = -0.5f * t3 + t2 - 0.5f * t;
+    w[1] =  1.5f * t3 - 2.5f * t2 + 1.0f;
+    w[2] = -1.5f * t3 + 2.0f * t2 + 0.5f * t;
+    w[3] =  0.5f * t3 - 0.5f * t2;
+}
+inline void weaveSamplePixel(device const float* img, int W, int H,
+                             float sx, float sy, thread float* out4)
+{
+    float fx = floor(sx), fy = floor(sy);
+    int x0 = int(fx), y0 = int(fy);
+    float wx[4], wy[4];
+    weaveCRw(sx - fx, wx);
+    weaveCRw(sy - fy, wy);
+    for (int c = 0; c < 4; ++c) out4[c] = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        int yy = y0 - 1 + j;
+        int yc = yy < 0 ? 0 : (yy >= H ? H - 1 : yy);
+        for (int i = 0; i < 4; ++i) {
+            int xx = x0 - 1 + i;
+            int xc = xx < 0 ? 0 : (xx >= W ? W - 1 : xx);
+            float w = wx[i] * wy[j];
+            int o = (yc * W + xc) * 4;
+            out4[0] += w * img[o + 0];
+            out4[1] += w * img[o + 1];
+            out4[2] += w * img[o + 2];
+            out4[3] += w * img[o + 3];
+        }
     }
 }
 
@@ -637,8 +726,10 @@ inline void deliverInput(constant SpeakParams& pr, float r, float g, float b,
 
 inline void processPixel(float r, float g, float b, float srcA,
                          float scatR, float scatG, float scatB,
+                         float bloomR, float bloomG, float bloomB,
                          int x, int y, int W, int H,
                          constant SpeakParams& pr, device const uint* stats,
+                         int drawScopes,
                          thread float& outR, thread float& outG, thread float& outB)
 {
     int cs = pr.inputColorSpace;
@@ -646,13 +737,17 @@ inline void processPixel(float r, float g, float b, float srcA,
     bool dyeOn = (pr.enableDye != 0) && dyeActive(pr.profile);
     bool splitOn = (pr.enableSplit != 0) && splitActive(pr.profile);
     bool grainOn = grainActive(pr);
+    bool bloomOn = bloomActive(pr);
+    bool vignOn = vignActive(pr);
     bool bake = (pr.outputMode == 1);
-    if (!toneOn && !dyeOn && !splitOn && !grainOn && !bake) {
+    if (!toneOn && !dyeOn && !splitOn && !grainOn && !bloomOn && !vignOn && !bake) {
         outR = r; outG = g; outB = b;
     } else {
         float mr, mg, mb;
-        lookLinear(r, g, b, scatR, scatG, scatB, pr, mr, mg, mb);
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, mr, mg, mb);
         applyGrain(mr, mg, mb, srcA, x, y, H, pr);
+        bloomApplyPixel(mr, mg, mb, bloomR, bloomG, bloomB, pr);
         if (bake) {
             float rr, rg, rb;
             gamutToRec709Lin(cs, mr, mg, mb, rr, rg, rb);
@@ -700,7 +795,8 @@ inline void processPixel(float r, float g, float b, float srcA,
     // received, through the same output transform. Never auto-gained.
     if (pr.viewMode == 4) {
         float pr0, pg0, pb0, pr1, pg1, pb1;
-        lookLinear(r, g, b, scatR, scatG, scatB, pr, pr0, pg0, pb0);
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, pr0, pg0, pb0);
         pr1 = pr0; pg1 = pg0; pb1 = pb0;
         applyGrain(pr1, pg1, pb1, srcA, x, y, H, pr);
         float gr = k18Gray + (pr1 - pr0);
@@ -725,9 +821,42 @@ inline void processPixel(float r, float g, float b, float srcA,
         }
     }
 
-    float sr, sg, sb;
-    if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
-    if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    // Isolated-bloom view: gray + the SIGNED delta (out - look); the borrow
+    // at sources is negative, the halo positive — see speak_core.h.
+    if (pr.viewMode == 5) {
+        float lr0, lg0, lb0, lr1, lg1, lb1;
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, lr0, lg0, lb0);
+        applyGrain(lr0, lg0, lb0, srcA, x, y, H, pr);
+        lr1 = lr0; lg1 = lg0; lb1 = lb0;
+        bloomApplyPixel(lr1, lg1, lb1, bloomR, bloomG, bloomB, pr);
+        float gr = k18Gray + (lr1 - lr0);
+        float gg = k18Gray + (lg1 - lg0);
+        float gb = k18Gray + (lb1 - lb0);
+        if (bake) {
+            float rr, rg, rb;
+            gamutToRec709Lin(cs, gr, gg, gb, rr, rg, rb);
+            gr = rr < 0.0f ? 0.0f : rr;
+            gg = rg < 0.0f ? 0.0f : rg;
+            gb = rb < 0.0f ? 0.0f : rb;
+            outR = encodeFromLinear(1, gr);
+            outG = encodeFromLinear(1, gg);
+            outB = encodeFromLinear(1, gb);
+        } else {
+            gr = gr < 0.0f ? 0.0f : gr;
+            gg = gg < 0.0f ? 0.0f : gg;
+            gb = gb < 0.0f ? 0.0f : gb;
+            outR = encodeFromLinear(cs, gr);
+            outG = encodeFromLinear(cs, gg);
+            outB = encodeFromLinear(cs, gb);
+        }
+    }
+
+    if (drawScopes != 0) {
+        float sr, sg, sb;
+        if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+        if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    }
 }
 
 // The scatter pyramid, mirroring buildHalScatter in speak_core.h. Four passes:
@@ -753,9 +882,11 @@ kernel void SpeakExcessKernel(constant SpeakParams& p [[buffer(0)]],
     float th = p.profile.halThresh;
     int i = (y * W + x) * 4;
     int o = (y * W + x) * 3;
-    arena[o + 0] = halExcess(decodeToLinear(cs, src[i + 0]), th);
-    arena[o + 1] = halExcess(decodeToLinear(cs, src[i + 1]), th);
-    arena[o + 2] = halExcess(decodeToLinear(cs, src[i + 2]), th);
+    // vignette first: light the lens never delivered cannot halate
+    float vg = vignGain(x, y, W, H, p);
+    arena[o + 0] = halExcess(vg * decodeToLinear(cs, src[i + 0]), th);
+    arena[o + 1] = halExcess(vg * decodeToLinear(cs, src[i + 1]), th);
+    arena[o + 2] = halExcess(vg * decodeToLinear(cs, src[i + 2]), th);
 }
 
 // One octave: level L-1 -> level L. Dispatched once per level, on level L's grid.
@@ -792,7 +923,7 @@ kernel void SpeakAccumKernel(constant SpeakParams& p [[buffer(0)]],
 {
     if ((int)gid.x >= lv.lw || (int)gid.y >= lv.lh) return;
     int x = int(gid.x), y = int(gid.y);
-    float sig = halSigmaPx(H, p);
+    float sig = (lv.isBloom != 0) ? bloomSigmaPx(H, p) : halSigmaPx(H, p);
     float v[3];
     halAccumPixel(arena, lv, sig, x, y, v);
     int o = (lv.off + y * lv.lw + x) * 3;
@@ -804,22 +935,34 @@ kernel void SpeakAccumKernel(constant SpeakParams& p [[buffer(0)]],
 // from the host so it uses the very same in-kernel halLevelWeight the accumulate
 // used — a host-side sum through a different exp2/log2 would drift the whole
 // scatter field by a scale parity would then charge to the pyramid.
+// `norm.isBloom` selects the profile; the veil share and its weight are
+// computed IN-KERNEL from the same halWeightSum the accumulate used, so no
+// host-side exp2 can drift the scale (the same reason inv lives here).
+struct HalNorm { float coreFall, skirtFall; int isBloom, _pad; };
 kernel void SpeakNormalizeKernel(constant SpeakParams& p [[buffer(0)]],
                                  constant int& W [[buffer(1)]],
                                  constant int& H [[buffer(2)]],
-                                 device const float* arena [[buffer(3)]],
-                                 device float* scat [[buffer(4)]],
+                                 constant HalNorm& norm [[buffer(3)]],
+                                 device const float* arena [[buffer(4)]],
+                                 device float* scat [[buffer(5)]],
+                                 device const float* meanC [[buffer(6)]],
                                  uint2 gid [[thread_position_in_grid]])
 {
     if ((int)gid.x >= W || (int)gid.y >= H) return;
     int x = int(gid.x), y = int(gid.y);
     int nLev = halLevelCount(W, H);
-    float sig = halSigmaPx(H, p);
-    float inv = 1.0f / halWeightSum(nLev, sig);
+    float sig = (norm.isBloom != 0) ? bloomSigmaPx(H, p) : halSigmaPx(H, p);
+    float base = halWeightSum(nLev, sig, norm.coreFall, norm.skirtFall);
+    float veil = 0.0f;
+    if (norm.isBloom != 0) {
+        float v = clampf(p.profile.bloomVeil, 0.0f, 0.9f);
+        if (v > 0.0f) veil = v / (1.0f - v) * base;
+    }
+    float inv = 1.0f / (base + veil);
     int o = (y * W + x) * 3;
-    scat[o + 0] = arena[o + 0] * inv;
-    scat[o + 1] = arena[o + 1] * inv;
-    scat[o + 2] = arena[o + 2] * inv;
+    scat[o + 0] = (arena[o + 0] + veil * meanC[0]) * inv;
+    scat[o + 1] = (arena[o + 1] + veil * meanC[1]) * inv;
+    scat[o + 2] = (arena[o + 2] + veil * meanC[2]) * inv;
 }
 
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
@@ -834,6 +977,7 @@ kernel void SpeakStatsKernel(constant SpeakParams& p [[buffer(0)]],
                              device const float* src [[buffer(3)]],
                              device atomic_uint* stats [[buffer(4)]],
                              device const float* scat [[buffer(5)]],
+                             device const float* bscat [[buffer(6)]],
                              uint2 gid [[thread_position_in_grid]])
 {
     int x = int(gid.x) * 2, y = int(gid.y) * 2;
@@ -849,9 +993,13 @@ kernel void SpeakStatsKernel(constant SpeakParams& p [[buffer(0)]],
         float sR = 0.0f, sG = 0.0f, sB = 0.0f;
         if (hal) { sR = scat[j + 0]; sG = scat[j + 1]; sB = scat[j + 2]; }
         float mr, mg, mb;
-        lookLinear(src[i + 0], src[i + 1], src[i + 2], sR, sG, sB, p, mr, mg, mb);
-        // Grain is part of the result, so the parade measures it (G17's rule).
+        lookLinear(src[i + 0], src[i + 1], src[i + 2], sR, sG, sB,
+                   vignGain(x, y, W, H, p), p, mr, mg, mb);
+        // Grain and bloom are part of the result, so the parade measures
+        // them (G17's rule; bscat is only dereferenced when the host built it).
         applyGrain(mr, mg, mb, src[i + 3], x, y, H, p);
+        if (bloomActive(p))
+            bloomApplyPixel(mr, mg, mb, bscat[j + 0], bscat[j + 1], bscat[j + 2], p);
         int col = wfColOf(x, W);
         atomic_fetch_add_explicit(&stats[wfIdx(0, col, wfRowOf(density10(mr)))], 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(&stats[wfIdx(1, col, wfRowOf(density10(mg)))], 1u, memory_order_relaxed);
@@ -878,6 +1026,8 @@ kernel void SpeakKernel(constant SpeakParams& p [[buffer(0)]],
                         device float* dst [[buffer(4)]],
                         device const uint* stats [[buffer(5)]],
                         device const float* scat [[buffer(6)]],
+                        device const float* bscat [[buffer(7)]],
+                        constant int& drawScopes [[buffer(8)]],
                         uint2 gid [[thread_position_in_grid]])
 {
     if ((int)gid.x >= W || (int)gid.y >= H) return;
@@ -887,9 +1037,96 @@ kernel void SpeakKernel(constant SpeakParams& p [[buffer(0)]],
     bool hal = halActive(p) || (p.viewMode == 3);
     float sR = 0.0f, sG = 0.0f, sB = 0.0f;
     if (hal) { sR = scat[j + 0]; sG = scat[j + 1]; sB = scat[j + 2]; }
+    bool blm = bloomActive(p) || (p.viewMode == 5);
+    float bR = 0.0f, bG = 0.0f, bB = 0.0f;
+    if (blm && bloomActive(p)) { bR = bscat[j + 0]; bG = bscat[j + 1]; bB = bscat[j + 2]; }
     float oR, oG, oB;
-    processPixel(src[i + 0], src[i + 1], src[i + 2], src[i + 3], sR, sG, sB, x, y, W, H, p, stats, oR, oG, oB);
+    processPixel(src[i + 0], src[i + 1], src[i + 2], src[i + 3], sR, sG, sB,
+                 bR, bG, bB, x, y, W, H, p, stats, drawScopes, oR, oG, oB);
     dst[i + 0] = oR; dst[i + 1] = oG; dst[i + 2] = oB; dst[i + 3] = src[i + 3];
+}
+
+// The LOOK's working-linear output (grain included) into arena level 0 — the
+// field bloom scatters. Mirrors speakFrame's lookBuf pass; the main kernel
+// RECOMPUTES the same values per pixel, so the two cannot disagree.
+kernel void SpeakLookKernel(constant SpeakParams& p [[buffer(0)]],
+                            constant int& W [[buffer(1)]],
+                            constant int& H [[buffer(2)]],
+                            device const float* src [[buffer(3)]],
+                            device const float* scat [[buffer(4)]],
+                            device float* arena [[buffer(5)]],
+                            uint2 gid [[thread_position_in_grid]])
+{
+    if ((int)gid.x >= W || (int)gid.y >= H) return;
+    int x = int(gid.x), y = int(gid.y);
+    int i = (y * W + x) * 4;
+    int j = (y * W + x) * 3;
+    bool hal = halActive(p) || (p.viewMode == 3);
+    float sR = 0.0f, sG = 0.0f, sB = 0.0f;
+    if (hal) { sR = scat[j + 0]; sG = scat[j + 1]; sB = scat[j + 2]; }
+    float lr, lg, lb;
+    lookLinear(src[i + 0], src[i + 1], src[i + 2], sR, sG, sB,
+               vignGain(x, y, W, H, p), p, lr, lg, lb);
+    applyGrain(lr, lg, lb, src[i + 3], x, y, H, p);
+    arena[j + 0] = lr; arena[j + 1] = lg; arena[j + 2] = lb;
+}
+
+// The veil's source: the frame mean, computed by ONE thread over the coarsest
+// level (geometry passed in, like the other level kernels). ~96 reads;
+// atomics-free by construction.
+struct BloomMean { int cw, ch, coff, _pad; };
+kernel void SpeakBloomMeanKernel(constant BloomMean& bm [[buffer(0)]],
+                                 device const float* arena [[buffer(1)]],
+                                 device float* meanC [[buffer(2)]],
+                                 uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x != 0 || gid.y != 0) return;
+    float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f;
+    for (int y = 0; y < bm.ch; ++y)
+        for (int x = 0; x < bm.cw; ++x) {
+            int o = (bm.coff + y * bm.cw + x) * 3;
+            m0 += arena[o + 0]; m1 += arena[o + 1]; m2 += arena[o + 2];
+        }
+    float invN = 1.0f / (float(bm.cw) * float(bm.ch));
+    meanC[0] = m0 * invN; meanC[1] = m1 * invN; meanC[2] = m2 * invN;
+}
+
+// The gate displaces the finished picture as one rigid sub-pixel move (all
+// four channels: the matte rides with the pixels it describes).
+struct WeaveDispC { float dx, dy; };
+kernel void SpeakWeaveKernel(constant int& W [[buffer(0)]],
+                             constant int& H [[buffer(1)]],
+                             constant WeaveDispC& d [[buffer(2)]],
+                             device const float* pre [[buffer(3)]],
+                             device float* dst [[buffer(4)]],
+                             uint2 gid [[thread_position_in_grid]])
+{
+    if ((int)gid.x >= W || (int)gid.y >= H) return;
+    int x = int(gid.x), y = int(gid.y);
+    float out4[4];
+    weaveSamplePixel(pre, W, H, float(x) - d.dx, float(y) - d.dy, out4);
+    int i = (y * W + x) * 4;
+    dst[i + 0] = out4[0]; dst[i + 1] = out4[1]; dst[i + 2] = out4[2]; dst[i + 3] = out4[3];
+}
+
+// Scopes on top of the displaced picture — panel chrome does not weave.
+kernel void SpeakScopeOverlayKernel(constant SpeakParams& p [[buffer(0)]],
+                                    constant int& W [[buffer(1)]],
+                                    constant int& H [[buffer(2)]],
+                                    device const uint* stats [[buffer(3)]],
+                                    device float* dst [[buffer(4)]],
+                                    uint2 gid [[thread_position_in_grid]])
+{
+    if ((int)gid.x >= W || (int)gid.y >= H) return;
+    int x = int(gid.x), y = int(gid.y);
+    float sr, sg, sb;
+    int i = (y * W + x) * 4;
+    if (hdScopePixel(x, y, W, H, p, stats, sr, sg, sb)) {
+        dst[i + 0] = sr; dst[i + 1] = sg; dst[i + 2] = sb;
+    }
+    if (densityScopePixel(x, y, W, H, p, stats, sr, sg, sb)) {
+        dst[i + 0] = sr; dst[i + 1] = sg; dst[i + 2] = sb;
+    }
 }
 )MSL";
 
@@ -902,7 +1139,14 @@ kernel void SpeakKernel(constant SpeakParams& p [[buffer(0)]],
 // must match the HalLevel / HalAccum structs declared in the MSL source above;
 // all fields 4 bytes).
 struct HalLevel { int sw, sh, so, dw, dh, doff; };
-struct HalAccum { int lw, lh, off, cw, ch, coff, L, nLev; };
+struct HalAccum { int lw, lh, off, cw, ch, coff, L, nLev;
+                  float coreFall, skirtFall; int isBloom, _pad; };
+struct HalNorm  { float coreFall, skirtFall; int isBloom, _pad; };
+struct BloomMean { int cw, ch, coff, _pad; };
+struct WeaveDispC { float dx, dy; };
+static const float kHostHalCoreFall   = 3.0f;   // == kHalCoreFall in-kernel
+static const float kHostHalSkirtFall  = 1.0f;
+static const float kHostBloomSkirtFall = 0.5f;
 
 static int halLevelCount(int W, int H)
 {
@@ -933,6 +1177,60 @@ static bool halActive(const SpeakParams& pr)
 {
     return (pr.enableTone != 0) && (pr.strength > 0.0f) && (halAmountOf(pr) > 0.0f);
 }
+static float hostClampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+static float bloomAmountOf(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) ? hostClampf(pr.profile.bloomAmount, 0.0f, 1.0f) : 0.0f;
+}
+static bool bloomActive(const SpeakParams& pr)
+{
+    return (pr.strength > 0.0f) && (bloomAmountOf(pr) > 0.0f);
+}
+// ---- gate weave, host side: the displacement is frame-uniform, so it is
+// computed here with speak_core.h's exact closed form and passed to the
+// kernel (textually parallel copies below).
+static bool weaveActive(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) && (pr.strength > 0.0f)
+        && (pr.profile.weaveAmount > 0.0f)
+        && (pr.viewMode == SPEAK_VIEW_RESULT);
+}
+static float hostGrainHash(uint32_t ix, uint32_t iy, uint32_t f, uint32_t ch)
+{
+    uint32_t h = ix * 374761393u + iy * 668265263u + f * 2246822519u + ch * 3266489917u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return (static_cast<float>(h & 0xFFFFFFu) / 16777215.0f) * 2.0f - 1.0f;
+}
+static float hostWeaveSmooth1D(float t, uint32_t salt)
+{
+    const float tf = std::floor(t);
+    const int i0 = static_cast<int>(tf);
+    const float fr = t - tf;
+    const float sm = fr * fr * (3.0f - 2.0f * fr);
+    const float n0 = hostGrainHash(static_cast<uint32_t>(i0),     0x5EA7u, 0u, salt);
+    const float n1 = hostGrainHash(static_cast<uint32_t>(i0 + 1), 0x5EA7u, 0u, salt);
+    return n0 + (n1 - n0) * sm;
+}
+static void hostWeaveDisp(const SpeakParams& pr, int H, float& dx, float& dy)
+{
+    dx = 0.0f; dy = 0.0f;
+    if (!weaveActive(pr)) return;
+    const float amp = pr.profile.weaveAmount * 0.01f * static_cast<float>(H)
+                    * hostClampf(pr.strength, 0.0f, 1.0f);
+    const float speed = pr.profile.weaveSpeed > 0.0f ? pr.profile.weaveSpeed : 1.0f;
+    const float t = static_cast<float>(pr.frameIndex) * speed;
+    float sx = 0.0f, sy = 0.0f, norm = 0.0f;
+    for (int o = 0; o < 6; ++o) {                       // kWeaveOctaves
+        const float period = static_cast<float>(1 << (o + 1));
+        const float a = period;
+        sx += a * hostWeaveSmooth1D(t / period, static_cast<uint32_t>(2 * o));
+        sy += a * hostWeaveSmooth1D(t / period, static_cast<uint32_t>(2 * o + 1));
+        norm += a;
+    }
+    dx = amp * sx / norm;
+    dy = amp * 1.4f * sy / norm;
+}
 
 struct SpeakRes {
     id<MTLComputePipelineState> main = nil;
@@ -942,6 +1240,10 @@ struct SpeakRes {
     id<MTLComputePipelineState> decimate = nil;
     id<MTLComputePipelineState> accum = nil;
     id<MTLComputePipelineState> normalize = nil;
+    id<MTLComputePipelineState> look = nil;
+    id<MTLComputePipelineState> bloomMean = nil;
+    id<MTLComputePipelineState> weave = nil;
+    id<MTLComputePipelineState> scopeOverlay = nil;
     id<MTLBuffer> statsBuf = nil;
     // The scatter buffers are SIZE-DEPENDENT (unlike statsBuf, whose layout is
     // fixed): the host hands us proxy and full-res frames through the SAME queue,
@@ -951,6 +1253,11 @@ struct SpeakRes {
     size_t arenaFloats = 0;
     id<MTLBuffer> scatBuf = nil;
     size_t scatFloats = 0;
+    id<MTLBuffer> bloomScatBuf = nil;
+    size_t bloomScatFloats = 0;
+    id<MTLBuffer> bloomMeanBuf = nil;
+    id<MTLBuffer> preBuf = nil;         // weave: the pre-displacement picture
+    size_t preFloats = 0;
     // Bound in place of scatBuf when the whole chain is skipped, so the stats and
     // main kernels always get a VALID binding (a null binding crashes). Its
     // contents are never read: the kernels guard the load on the same condition
@@ -1001,8 +1308,17 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
             r.accum = [device newComputePipelineStateWithFunction:fa error:&err];
             id<MTLFunction> fnm = [lib newFunctionWithName:@"SpeakNormalizeKernel"];
             r.normalize = [device newComputePipelineStateWithFunction:fnm error:&err];
+            id<MTLFunction> fl = [lib newFunctionWithName:@"SpeakLookKernel"];
+            r.look = [device newComputePipelineStateWithFunction:fl error:&err];
+            id<MTLFunction> fbm = [lib newFunctionWithName:@"SpeakBloomMeanKernel"];
+            r.bloomMean = [device newComputePipelineStateWithFunction:fbm error:&err];
+            id<MTLFunction> fw = [lib newFunctionWithName:@"SpeakWeaveKernel"];
+            r.weave = [device newComputePipelineStateWithFunction:fw error:&err];
+            id<MTLFunction> fso = [lib newFunctionWithName:@"SpeakScopeOverlayKernel"];
+            r.scopeOverlay = [device newComputePipelineStateWithFunction:fso error:&err];
             if (!r.main || !r.stats || !r.statsMax ||
-                !r.excess || !r.decimate || !r.accum || !r.normalize) {
+                !r.excess || !r.decimate || !r.accum || !r.normalize ||
+                !r.look || !r.bloomMean || !r.weave || !r.scopeOverlay) {
                 fprintf(stderr, "Speak: pipeline failed\n"); return;
             }
         }
@@ -1015,20 +1331,47 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
         // Skip the whole scatter chain when halation is inactive (mirrors
         // speakFrame's `hal`): the identity path stays bit-exact AND free.
         const bool wantHalAlloc = halActive(p_Params) || (p_Params.viewMode == SPEAK_VIEW_SCATTER);
-        if (wantHalAlloc) {
+        const bool wantBloomAlloc = bloomActive(p_Params);
+        if (wantHalAlloc || wantBloomAlloc) {
+            // bloom reuses the ARENA sequentially (halation's content is dead
+            // after its normalize), so one arena serves both pyramids.
             const size_t needArena = static_cast<size_t>(halArenaPixels(p_Width, p_Height)) * 3;
-            const size_t needScat = static_cast<size_t>(p_Width) * p_Height * 3;
             if (r.arenaBuf == nil || r.arenaFloats < needArena) {
                 r.arenaBuf = [device newBufferWithLength:(needArena * sizeof(float))
                                                  options:MTLResourceStorageModePrivate];
                 r.arenaFloats = needArena;
             }
+            if (!r.arenaBuf) { fprintf(stderr, "Speak: arena alloc failed\n"); return; }
+        }
+        if (wantHalAlloc) {
+            const size_t needScat = static_cast<size_t>(p_Width) * p_Height * 3;
             if (r.scatBuf == nil || r.scatFloats < needScat) {
                 r.scatBuf = [device newBufferWithLength:(needScat * sizeof(float))
                                                 options:MTLResourceStorageModePrivate];
                 r.scatFloats = needScat;
             }
-            if (!r.arenaBuf || !r.scatBuf) { fprintf(stderr, "Speak: scatter alloc failed\n"); return; }
+            if (!r.scatBuf) { fprintf(stderr, "Speak: scatter alloc failed\n"); return; }
+        }
+        if (wantBloomAlloc) {
+            const size_t needScat = static_cast<size_t>(p_Width) * p_Height * 3;
+            if (r.bloomScatBuf == nil || r.bloomScatFloats < needScat) {
+                r.bloomScatBuf = [device newBufferWithLength:(needScat * sizeof(float))
+                                                     options:MTLResourceStorageModePrivate];
+                r.bloomScatFloats = needScat;
+            }
+            if (r.bloomMeanBuf == nil)
+                r.bloomMeanBuf = [device newBufferWithLength:(4 * sizeof(float))
+                                                     options:MTLResourceStorageModePrivate];
+            if (!r.bloomScatBuf || !r.bloomMeanBuf) { fprintf(stderr, "Speak: bloom alloc failed\n"); return; }
+        }
+        if (weaveActive(p_Params)) {
+            const size_t needPre = static_cast<size_t>(p_Width) * p_Height * 4;
+            if (r.preBuf == nil || r.preFloats < needPre) {
+                r.preBuf = [device newBufferWithLength:(needPre * sizeof(float))
+                                               options:MTLResourceStorageModePrivate];
+                r.preFloats = needPre;
+            }
+            if (!r.preBuf) { fprintf(stderr, "Speak: weave alloc failed\n"); return; }
         }
         res = r;
     }
@@ -1092,6 +1435,8 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
             if (L < nLev - 1) halLevelInfo(W, H, L + 1, lv.cw, lv.ch, lv.coff);
             else              { lv.cw = 0; lv.ch = 0; lv.coff = 0; }   // unread: no level above
             lv.L = L; lv.nLev = nLev;
+            lv.coreFall = kHostHalCoreFall; lv.skirtFall = kHostHalSkirtFall;
+            lv.isBloom = 0; lv._pad = 0;
             [enc setComputePipelineState:res.accum];
             [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
             [enc setBytes:&H length:sizeof(int) atIndex:1];
@@ -1102,12 +1447,87 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];   // level L+1 -> L
         }
 
+        HalNorm hn; hn.coreFall = kHostHalCoreFall; hn.skirtFall = kHostHalSkirtFall;
+        hn.isBloom = 0; hn._pad = 0;
         [enc setComputePipelineState:res.normalize];
         [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
         [enc setBytes:&W length:sizeof(int) atIndex:1];
         [enc setBytes:&H length:sizeof(int) atIndex:2];
-        [enc setBuffer:res.arenaBuf offset:0 atIndex:3];
-        [enc setBuffer:res.scatBuf offset:0 atIndex:4];
+        [enc setBytes:&hn length:sizeof(HalNorm) atIndex:3];
+        [enc setBuffer:res.arenaBuf offset:0 atIndex:4];
+        [enc setBuffer:res.scatBuf offset:0 atIndex:5];
+        [enc setBuffer:res.nullBuf offset:0 atIndex:6];   // no veil for halation
+        [enc dispatchThreadgroups:full threadsPerThreadgroup:tg];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    }
+
+    // ---- bloom chain: look field -> pyramid on the arena -> mean -> normalize.
+    // The parade measures bloom, so this must complete BEFORE the stats pass
+    // (the same ordering rule the halation chain established).
+    const bool wantBloom = bloomActive(params);
+    id<MTLBuffer> bscatBind = wantBloom ? res.bloomScatBuf : res.nullBuf;
+    if (wantBloom) {
+        const MTLSize full = MTLSizeMake((p_Width + 15) / 16, (p_Height + 15) / 16, 1);
+        [enc setComputePipelineState:res.look];
+        [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
+        [enc setBytes:&W length:sizeof(int) atIndex:1];
+        [enc setBytes:&H length:sizeof(int) atIndex:2];
+        [enc setBuffer:src offset:0 atIndex:3];
+        [enc setBuffer:scatBind offset:0 atIndex:4];
+        [enc setBuffer:res.arenaBuf offset:0 atIndex:5];
+        [enc dispatchThreadgroups:full threadsPerThreadgroup:tg];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        const int nLev = halLevelCount(W, H);
+        for (int L = 1; L < nLev; ++L) {
+            HalLevel lv;
+            halLevelInfo(W, H, L - 1, lv.sw, lv.sh, lv.so);
+            halLevelInfo(W, H, L,     lv.dw, lv.dh, lv.doff);
+            [enc setComputePipelineState:res.decimate];
+            [enc setBytes:&lv length:sizeof(HalLevel) atIndex:0];
+            [enc setBuffer:res.arenaBuf offset:0 atIndex:1];
+            [enc dispatchThreadgroups:MTLSizeMake((lv.dw + 15) / 16, (lv.dh + 15) / 16, 1)
+                threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
+        // the frame mean BEFORE the in-place accumulate overwrites the levels
+        BloomMean bm; halLevelInfo(W, H, nLev - 1, bm.cw, bm.ch, bm.coff); bm._pad = 0;
+        [enc setComputePipelineState:res.bloomMean];
+        [enc setBytes:&bm length:sizeof(BloomMean) atIndex:0];
+        [enc setBuffer:res.arenaBuf offset:0 atIndex:1];
+        [enc setBuffer:res.bloomMeanBuf offset:0 atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        for (int L = nLev - 1; L >= 0; --L) {
+            HalAccum lv;
+            halLevelInfo(W, H, L, lv.lw, lv.lh, lv.off);
+            if (L < nLev - 1) halLevelInfo(W, H, L + 1, lv.cw, lv.ch, lv.coff);
+            else              { lv.cw = 0; lv.ch = 0; lv.coff = 0; }
+            lv.L = L; lv.nLev = nLev;
+            lv.coreFall = kHostHalCoreFall; lv.skirtFall = kHostBloomSkirtFall;
+            lv.isBloom = 1; lv._pad = 0;
+            [enc setComputePipelineState:res.accum];
+            [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
+            [enc setBytes:&H length:sizeof(int) atIndex:1];
+            [enc setBytes:&lv length:sizeof(HalAccum) atIndex:2];
+            [enc setBuffer:res.arenaBuf offset:0 atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake((lv.lw + 15) / 16, (lv.lh + 15) / 16, 1)
+                threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
+        HalNorm bn; bn.coreFall = kHostHalCoreFall; bn.skirtFall = kHostBloomSkirtFall;
+        bn.isBloom = 1; bn._pad = 0;
+        [enc setComputePipelineState:res.normalize];
+        [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
+        [enc setBytes:&W length:sizeof(int) atIndex:1];
+        [enc setBytes:&H length:sizeof(int) atIndex:2];
+        [enc setBytes:&bn length:sizeof(HalNorm) atIndex:3];
+        [enc setBuffer:res.arenaBuf offset:0 atIndex:4];
+        [enc setBuffer:res.bloomScatBuf offset:0 atIndex:5];
+        [enc setBuffer:res.bloomMeanBuf offset:0 atIndex:6];
         [enc dispatchThreadgroups:full threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
@@ -1120,6 +1540,7 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
         [enc setBuffer:src offset:0 atIndex:3];
         [enc setBuffer:res.statsBuf offset:0 atIndex:4];
         [enc setBuffer:scatBind offset:0 atIndex:5];
+        [enc setBuffer:bscatBind offset:0 atIndex:6];
         // ceil(W/2) sample threads (the kernel indexes x = gid*2). This form
         // already over-covered and was never short, but state the intent the
         // same way the other two backends now do — they WERE short by one column
@@ -1135,6 +1556,8 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
 
+    const bool weave = weaveActive(params);
+    int drawScopes = weave ? 0 : 1;
     [enc setComputePipelineState:res.main];
     [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
     [enc setBytes:&W length:sizeof(int) atIndex:1];
@@ -1143,8 +1566,40 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
     [enc setBuffer:dst offset:0 atIndex:4];
     [enc setBuffer:res.statsBuf offset:0 atIndex:5];
     [enc setBuffer:scatBind offset:0 atIndex:6];
+    [enc setBuffer:bscatBind offset:0 atIndex:7];
+    [enc setBytes:&drawScopes length:sizeof(int) atIndex:8];
     const MTLSize grid = MTLSizeMake((p_Width + 15) / 16, (p_Height + 15) / 16, 1);
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+
+    if (weave) {
+        // The gate displaces the finished picture; scopes are overlaid after,
+        // pinned (mirrors speakFrame's weave pass).
+        [enc endEncoding];
+        id<MTLBlitCommandEncoder> blit = [cmdBuf blitCommandEncoder];
+        [blit copyFromBuffer:dst sourceOffset:0 toBuffer:res.preBuf destinationOffset:0
+                        size:(static_cast<size_t>(W) * H * 4 * sizeof(float))];
+        [blit endEncoding];
+        enc = [cmdBuf computeCommandEncoder];
+        WeaveDispC wd;
+        hostWeaveDisp(params, H, wd.dx, wd.dy);
+        [enc setComputePipelineState:res.weave];
+        [enc setBytes:&W length:sizeof(int) atIndex:0];
+        [enc setBytes:&H length:sizeof(int) atIndex:1];
+        [enc setBytes:&wd length:sizeof(WeaveDispC) atIndex:2];
+        [enc setBuffer:res.preBuf offset:0 atIndex:3];
+        [enc setBuffer:dst offset:0 atIndex:4];
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        if (params.scopeHD != 0 || params.scopeDensity != 0) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:res.scopeOverlay];
+            [enc setBytes:&params length:sizeof(SpeakParams) atIndex:0];
+            [enc setBytes:&W length:sizeof(int) atIndex:1];
+            [enc setBytes:&H length:sizeof(int) atIndex:2];
+            [enc setBuffer:res.statsBuf offset:0 atIndex:3];
+            [enc setBuffer:dst offset:0 atIndex:4];
+            [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        }
+    }
     [enc endEncoding];
     [cmdBuf commit];
 }

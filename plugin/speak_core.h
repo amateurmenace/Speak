@@ -482,7 +482,16 @@ static inline float halLevelSigma(int L)
 // Gaussian in G14; kHalSkirtFall is a MODELLED DEFAULT, not a cited constant.
 static const float kHalCoreFall  = 3.0f;   // octaves tighter than target: fast cut
 static const float kHalSkirtFall = 1.0f;   // octaves broader: halve per octave
-static inline float halLevelWeight(int L, float sigmaTarget)
+
+// The fall rates are ARGUMENTS because two optics modules share this pyramid
+// machinery with different profiles: halation reads (kHalCoreFall,
+// kHalSkirtFall); bloom reads a broader skirt (its veiling floor is a frame-
+// mean term handled at normalization, not a level weight — see
+// buildBloomScatter). Halation's call sites pass its old constants verbatim,
+// so its arithmetic is bit-identical to the pre-bloom build (pinned by the
+// halation gates).
+static inline float halLevelWeight(int L, float sigmaTarget,
+                                   float coreFall, float skirtFall)
 {
     // Target level from sigma_L -> kHalSigmaC * 2^L  =>  L_t = log2(sigma/C).
     // Continuous in L_t, so the radius slider is smooth: it does NOT snap to
@@ -491,7 +500,7 @@ static inline float halLevelWeight(int L, float sigmaTarget)
     const float s = sigmaTarget < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : sigmaTarget;
     const float Lt = std::log2(s / kHalSigmaC);
     const float d = static_cast<float>(L) - Lt;
-    return (d <= 0.0f) ? std::exp2(kHalCoreFall * d) : std::exp2(-kHalSkirtFall * d);
+    return (d <= 0.0f) ? std::exp2(coreFall * d) : std::exp2(-skirtFall * d);
 }
 
 // ---- pyramid taps (per-pixel, so the GPU kernels are textual ports) ----
@@ -565,10 +574,12 @@ static inline float halSampleLevel(const float* arena, int off, int lw, int lh,
 // The mixture's total weight — the normalizer that makes the pyramid
 // energy-preserving (each level is mean-preserving, so a convex combination of
 // them carries exactly the source's energy). Same loop on every backend.
-static inline float halWeightSum(int nLev, float sigmaTarget)
+static inline float halWeightSum(int nLev, float sigmaTarget,
+                                 float coreFall, float skirtFall)
 {
     float wsum = 0.0f;
-    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget);
+    for (int L = 0; L < nLev; ++L)
+        wsum += halLevelWeight(L, sigmaTarget, coreFall, skirtFall);
     return wsum;
 }
 
@@ -595,11 +606,12 @@ static inline float halWeightSum(int nLev, float sigmaTarget)
 // In-place is safe: a thread reads its OWN (x,y) at level L and a neighbourhood
 // at level L+1 (a disjoint region), and writes only its own (x,y) at level L.
 static inline void halAccumPixel(float* arena, int W, int H, int L, int nLev,
-                                 float sigmaTarget, int x, int y, float* out)
+                                 float sigmaTarget, float coreFall, float skirtFall,
+                                 int x, int y, float* out)
 {
     int lw, lh, off;
     halLevelInfo(W, H, L, lw, lh, off);
-    const float wl = halLevelWeight(L, sigmaTarget);
+    const float wl = halLevelWeight(L, sigmaTarget, coreFall, skirtFall);
     if (L >= nLev - 1) {                       // the coarsest level: nothing above it
         for (int c = 0; c < 3; ++c) out[c] = wl * halFetch(arena, off, lw, lh, x, y, c);
         return;
@@ -738,6 +750,268 @@ static inline void applyGrain(float& r, float& g, float& b, float conf,
 }
 
 // ---------------------------------------------------------------------------
+// BLOOM / VEILING GLARE (Phase 4, spec 1B.5) — the second optics module.
+//
+// THE PHYSICS. Glare in the viewing/printing optics scatters a fraction of
+// the light of the FINISHED image: some of every ray is redistributed by the
+// glass, the aperture and internal reflections. Two consequences the model
+// keeps, because they are the phenomenon:
+//   1. A lens TRANSMITS — it creates no light and (to first order) loses
+//      none. So bloom is a CONVEX MIX toward a mean-preserving scatter of
+//      the image itself:  out = (1-a)*L + a*S[L],  with S built from
+//      mean-preserving decimation and normalized weights (Sum w = 1). Total
+//      linear energy is conserved BY CONSTRUCTION (gate G26 measures it, and
+//      measures that the additive strawman FAILS it). Highlights dim
+//      slightly as their light leaves; surroundings lift as it arrives —
+//      spec 1B.5's "borrows highlight energy and subtracts it from the
+//      source" falls out rather than being programmed in.
+//   2. There is NO THRESHOLD. A PSF applies to every ray, not only to
+//      values above a knee; the visible effect concentrates at highlights
+//      only because they dominate the scattered sum. (bloomThresh is
+//      deliberately absent — a thresholded bloom is the video-game screen
+//      effect, and it cannot conserve energy across the knee.)
+//
+// SPECTRALLY NEUTRAL, deliberately: glass scatter has no antihalation layer,
+// so per-channel weights are all 1. A blue neon blooms blue (G28) — where
+// halation, one module up the light path, halates red (H3a). The two views
+// side by side are the honest demonstration that these are different physics.
+//
+// THE VEILING FLOOR. The far-field term of the same glare: stray light that
+// arrives UNIFORMLY, lifting blacks in proportion to how much light the
+// frame carries (the veiling-glare of ISO 9358 — that standard describes
+// CAMERA LENSES, so citing it here passes the "is the cited work about THIS
+// phenomenon?" test; the eye's glare-spread function would not). It is the
+// pyramid taken to its logical end — the frame MEAN — mixed into the same
+// normalized sum:
+//     S = [ Sum_L w_L * up(level_L)  +  w_veil * mean(look) ] / (Sum w + w_veil)
+//   - the black-lift scales with FRAME luminance exactly (G29c), which a
+//     coarsest-LEVEL weight would not give: an 8x5 level's corner texels
+//     never see a centre highlight, and the first draft's floor measurably
+//     failed to rise at the far corner (the gate caught it — G29b);
+//   - normalization keeps the total weight 1, so conservation survives any
+//     veil setting (a hazier element trades local contrast for flare);
+//   - the mean is computed by finishing the decimation chain (a ~96-texel
+//     sum over the coarsest level), so it stays atomics-free (Apple's OpenCL
+//     atomics bug can never touch it).
+// bloomVeil is the veil's SHARE of the scattered light: w_veil = v/(1-v) *
+// (sum of the profile weights), which makes the share exactly v after
+// normalization — a claim the hint can state and G29a pins as arithmetic.
+// kBloomSkirtFall and the defaults are MODELLED, stated as such; the
+// MECHANISM (near-field halo + luminance-proportional veil) is the published
+// part.
+//
+// SITED after the print, in the look's working linear (spec 1B.5: "added in
+// linear AFTER the print"), grain included — the projector sees the print's
+// grain through the same glass. Physically this is the OTHER side of the
+// tone scale from halation (which re-exposes the negative), which is why
+// bloom builds its own pyramid on the LOOK field rather than literally
+// re-reading halation's scene-referred excess pyramid: an energy-conserving
+// mix must subtract light in the same domain where it re-adds it, and the
+// spec's "read the same pyramid twice" predates the injection-site
+// measurement that fixed halation's build order. The MACHINERY is shared
+// textually (decimate / B-spline accumulate / weight profile with arguments).
+// ---------------------------------------------------------------------------
+static const float kBloomSkirtFall = 0.5f;  // broader skirt than halation's 1.0
+                                            // (modelled default, stated as such)
+
+static inline float bloomAmountOf(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) ? clampf(pr.profile.bloomAmount, 0.0f, 1.0f) : 0.0f;
+}
+// Unlike halation, bloom does NOT require enableTone: it acts on the look's
+// output whatever the look is (a dye-only grade still projects through glass).
+static inline bool bloomActive(const SpeakParams& pr)
+{
+    return (pr.strength > 0.0f) && (bloomAmountOf(pr) > 0.0f);
+}
+static inline float bloomSigmaPx(int H, const SpeakParams& pr)
+{
+    const float s = pr.profile.bloomRadius * 0.01f * static_cast<float>(H);
+    return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
+}
+// The veil's mixture weight, from its target share v (see the header block
+// above). Frame-uniform, tiny loop, identical on every backend.
+static inline float bloomVeilAdd(int nLev, float sigmaTarget, const SpeakParams& pr)
+{
+    const float v = clampf(pr.profile.bloomVeil, 0.0f, 0.9f);
+    if (v <= 0.0f) return 0.0f;
+    const float base = halWeightSum(nLev, sigmaTarget, kHalCoreFall, kBloomSkirtFall);
+    return v / (1.0f - v) * base;
+}
+
+// The energy-conserving mix at one pixel. `s*` is the normalized bloom
+// scatter sampled at this pixel; the amount rides the global Strength like
+// every other look stage (the scope-defect-(a) lesson: nothing in the look
+// may ignore the mix the pixels use).
+static inline void bloomApplyPixel(float& r, float& g, float& b,
+                                   float sR, float sG, float sB,
+                                   const SpeakParams& pr)
+{
+    if (!bloomActive(pr)) return;
+    const float a = bloomAmountOf(pr) * clampf(pr.strength, 0.0f, 1.0f);
+    r = lerpf(r, sR, a);
+    g = lerpf(g, sG, a);
+    b = lerpf(b, sB, a);
+}
+
+// ---------------------------------------------------------------------------
+// VIGNETTE (Phase 4) — the cosine-fourth law.
+//
+// THE PHYSICS. Off-axis image points receive less light for four compounding
+// geometric reasons (inverse-square to a tilted exit pupil, twice-obliquity,
+// pupil foreshortening); their product is the classic cos^4(theta) natural
+// illumination falloff of photographic lenses — published lens photometry
+// about exactly this phenomenon, so citing it passes the project's own test.
+// Mechanical vignetting (hoods, stacked filters) is steeper and is NOT
+// modelled; `amount` mixes toward the natural cos^4 floor, no further.
+//
+// SITED AT CAPTURE, deliberately: the taking lens attenuates the light that
+// EXPOSES the negative, so a vignetted corner rides DOWN the H&D toe — its
+// contrast and color respond like film, not like a post-look dim. The gain
+// therefore multiplies scene-linear ahead of everything, including the
+// halation excess extraction (light that never arrived cannot scatter), and
+// G33 pins the injection site as arithmetic: a corner pixel must equal a
+// centre pixel whose scene light was pre-scaled by the same gain.
+//
+// Geometry: tan(theta) at a pixel scales linearly with its distance from
+// centre; vignField names the HALF-DIAGONAL field angle in degrees (a lens
+// FOV knob — 27 degrees ~ a normal lens; MODELLED default, the hint says
+// so). cos^2 = 1/(1+tan^2) keeps it trig-free per pixel.
+// ---------------------------------------------------------------------------
+static inline bool vignActive(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) && (pr.strength > 0.0f)
+        && (pr.profile.vignAmount > 0.0f);
+}
+static inline float vignGain(int x, int y, int W, int H, const SpeakParams& pr)
+{
+    if (!vignActive(pr)) return 1.0f;
+    const float a = clampf(pr.profile.vignAmount, 0.0f, 1.0f)
+                  * clampf(pr.strength, 0.0f, 1.0f);
+    const float cx = 0.5f * static_cast<float>(W - 1);
+    const float cy = 0.5f * static_cast<float>(H - 1);
+    const float dx = static_cast<float>(x) - cx;
+    const float dy = static_cast<float>(y) - cy;
+    const float rhd2 = cx * cx + cy * cy;            // half-diagonal, squared
+    const float r2 = (dx * dx + dy * dy) / (rhd2 > 0.0f ? rhd2 : 1.0f);
+    const float tanm = std::tan(pr.profile.vignField * 0.017453293f);
+    const float c2 = 1.0f / (1.0f + r2 * tanm * tanm);   // cos^2(theta)
+    return lerpf(1.0f, c2 * c2, a);
+}
+
+// ---------------------------------------------------------------------------
+// GATE WEAVE (Phase 4) — the transport's picture-position noise.
+//
+// Film in a camera or projector gate is registered by perforations with real
+// mechanical slop: the picture wanders, slowly and slightly, mostly along
+// the transport axis. The MODEL: a per-frame global sub-pixel displacement
+// (dx, dy), built as an octave stack of hash-lattice value noise over the
+// FRAME INDEX — amplitude proportional to period, i.e. a ~1/f spectrum: the
+// top octave stands in for per-frame pulldown jitter, the bottom for the
+// long wander. All constants are MODELLED defaults, stated as such.
+//
+// Deterministic closed form of frameIndex, deliberately: scrubbing is
+// repeatable, a re-render is identical, and all four backends agree bit-for-
+// bit because the source of randomness is the SAME uint32 hash grain uses —
+// integer math plus lerp, no trig. (A sine stack was rejected: sin() of a
+// six-figure frame index diverges across backend math libraries, and its
+// octave periods share a short LCM that visibly loops.)
+//
+// The resample is Catmull-Rom, per spec 1B: a PICTURE resample must
+// interpolate — it reproduces a linear ramp exactly and does not soften —
+// where the scatter pyramid wanted B-spline's non-negative smoothing. Alpha
+// is displaced WITH the color it describes: Hush's matte must keep pointing
+// at the pixels it measured; "alpha passes through" means un-invented, not
+// un-moved. Clamp-to-edge exposes no invented content at the frame edge.
+//
+// Weave applies to the RESULT view only (and is the LAST spatial operation,
+// before the scopes are overlaid): the isolated diagnostic views hold still
+// so they can be read, and the scopes are panel chrome, not picture.
+// ---------------------------------------------------------------------------
+static const int kWeaveOctaves = 6;   // periods 2..64 frames (~1/f stack)
+
+static inline bool weaveActive(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) && (pr.strength > 0.0f)
+        && (pr.profile.weaveAmount > 0.0f)
+        && (pr.viewMode == SPEAK_VIEW_RESULT);
+}
+
+// 1-D value noise on the frame-index axis: hash at integer frames, C1
+// smoothstep between them. Bounded arguments at any frame index.
+static inline float weaveSmooth1D(float t, uint32_t salt)
+{
+    const float tf = std::floor(t);
+    const int i0 = static_cast<int>(tf);
+    const float fr = t - tf;
+    const float s = fr * fr * (3.0f - 2.0f * fr);
+    const float n0 = grainHash(static_cast<uint32_t>(i0),     0x5EA7u, 0u, salt);
+    const float n1 = grainHash(static_cast<uint32_t>(i0 + 1), 0x5EA7u, 0u, salt);
+    return n0 + (n1 - n0) * s;
+}
+
+// The frame's displacement in pixels. Frame-uniform (the whole picture moves
+// as one, which is what a gate does), amplitude format-relative (% of frame
+// height), transport axis (y) wandering more than lateral (modelled 1.4x).
+static inline void weaveDisp(const SpeakParams& pr, int H, float& dx, float& dy)
+{
+    dx = 0.0f; dy = 0.0f;
+    if (!weaveActive(pr)) return;
+    const float amp = pr.profile.weaveAmount * 0.01f * static_cast<float>(H)
+                    * clampf(pr.strength, 0.0f, 1.0f);
+    const float speed = pr.profile.weaveSpeed > 0.0f ? pr.profile.weaveSpeed : 1.0f;
+    const float t = static_cast<float>(pr.frameIndex) * speed;
+    float sx = 0.0f, sy = 0.0f, norm = 0.0f;
+    for (int o = 0; o < kWeaveOctaves; ++o) {
+        const float period = static_cast<float>(1 << (o + 1));   // 2..64 frames
+        const float a = period;                                   // amp ~ 1/f
+        sx += a * weaveSmooth1D(t / period, static_cast<uint32_t>(2 * o));
+        sy += a * weaveSmooth1D(t / period, static_cast<uint32_t>(2 * o + 1));
+        norm += a;
+    }
+    dx = amp * sx / norm;
+    dy = amp * 1.4f * sy / norm;
+}
+
+// Catmull-Rom weights: interpolating (w sums to 1, reproduces linears
+// exactly); the slight over/undershoot at hard edges is the sharpness.
+static inline void weaveCRw(float t, float* w)
+{
+    const float t2 = t * t, t3 = t2 * t;
+    w[0] = -0.5f * t3 + t2 - 0.5f * t;
+    w[1] =  1.5f * t3 - 2.5f * t2 + 1.0f;
+    w[2] = -1.5f * t3 + 2.0f * t2 + 0.5f * t;
+    w[3] =  0.5f * t3 - 0.5f * t2;
+}
+
+// One output pixel of the displaced picture: 4x4 Catmull-Rom at (sx, sy) in
+// the source, clamp-to-edge, all FOUR channels together (see header).
+static inline void weaveSamplePixel(const float* img, int W, int H,
+                                    float sx, float sy, float* out4)
+{
+    const float fx = std::floor(sx), fy = std::floor(sy);
+    const int x0 = static_cast<int>(fx), y0 = static_cast<int>(fy);
+    float wx[4], wy[4];
+    weaveCRw(sx - fx, wx);
+    weaveCRw(sy - fy, wy);
+    for (int c = 0; c < 4; ++c) out4[c] = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        const int yy = y0 - 1 + j;
+        const int yc = yy < 0 ? 0 : (yy >= H ? H - 1 : yy);
+        for (int i = 0; i < 4; ++i) {
+            const int xx = x0 - 1 + i;
+            const int xc = xx < 0 ? 0 : (xx >= W ? W - 1 : xx);
+            const float w = wx[i] * wy[j];
+            const size_t o = (static_cast<size_t>(yc) * W + xc) * 4;
+            out4[0] += w * img[o + 0];
+            out4[1] += w * img[o + 1];
+            out4[2] += w * img[o + 2];
+            out4[3] += w * img[o + 3];
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Live H&D curve scope (deterministic — a pure function of the params, so it is
 // parity-trivial). The curves are drawn by evaluating the SAME production
 // hdCurve()/chainDensity() the pixels use, so the plot can never disagree with
@@ -763,16 +1037,24 @@ static inline void applyGrain(float& r, float& g, float& b, float conf,
 // even be directional: halation raises E, so toneChannel(E) rises and density
 // falls, and a scatter-blind parade would draw the halo DARKER than it is —
 // exactly where the user opened the scope to look.
+// `vgain` is this pixel's vignette gain (1 when vignette is off) — the
+// taking-lens attenuation multiplies scene light AHEAD of the whole spine,
+// so it is an argument for the same reason scatter is: the density scope
+// calls this function too, and a vignette-blind parade would draw corner
+// columns brighter than the pixels (the same L3 class as a scatter-blind
+// scope). The H&D curve scope stays position-free by stated claim: it plots
+// the CENTRE curve (a transfer curve has no single field angle).
 static inline void lookLinear(float r, float g, float b,
                               float scatR, float scatG, float scatB,
+                              float vgain,
                               const SpeakParams& pr,
                               float& oR, float& oG, float& oB)
 {
     const SpeakProfile& p = pr.profile;
     const int cs = pr.inputColorSpace;
-    const float lr = decodeToLinear(cs, r);
-    const float lg = decodeToLinear(cs, g);
-    const float lb = decodeToLinear(cs, b);
+    const float lr = vgain * decodeToLinear(cs, r);
+    const float lg = vgain * decodeToLinear(cs, g);
+    const float lb = vgain * decodeToLinear(cs, b);
     float mr = lr, mg = lg, mb = lb;
     if ((pr.enableTone != 0) && (pr.strength > 0.0f)) {
         const float s = clampf(pr.strength, 0.0f, 1.0f);
@@ -832,11 +1114,14 @@ static inline float pixelStops(int cs, float r, float g, float b)
     const float m = (decodeToLinear(cs, r) + decodeToLinear(cs, g) + decodeToLinear(cs, b)) * (1.0f / 3.0f);
     return std::log2((m < kLinTiny ? kLinTiny : m) / k18Gray);
 }
-// `scat` is the W*H*3 interleaved scatter field, or null when halation is off.
-// The density parade MUST see it — see the lookLinear header for why a
-// scatter-blind scope is an L3 bug parity cannot catch.
-inline void computeStats(const float* src, const float* scat, int W, int H,
-                         const SpeakParams& pr, uint32_t* stats)
+// `scat` is the W*H*3 interleaved halation scatter field (null when halation
+// is off) and `bscat` the bloom scatter field (null when bloom is off). The
+// density parade MUST see BOTH — see the lookLinear header for why a
+// scatter-blind scope is an L3 bug parity cannot catch; a bloom-blind parade
+// would draw highlight columns taller and shadow floors deeper than the
+// pixels the user is looking at.
+inline void computeStats(const float* src, const float* scat, const float* bscat,
+                         int W, int H, const SpeakParams& pr, uint32_t* stats)
 {
     for (int i = 0; i < SPEAK_STATS_UINTS; ++i) stats[i] = 0u;
     if (pr.scopeHD == 0 && pr.scopeDensity == 0) return;   // only measured when shown
@@ -851,11 +1136,16 @@ inline void computeStats(const float* src, const float* scat, int W, int H,
                 float mr, mg, mb;
                 lookLinear(src[i], src[i + 1], src[i + 2],
                            scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
-                           scat ? scat[j + 2] : 0.0f, pr, mr, mg, mb);
-                // Grain is part of the result, so the parade must measure it —
-                // the same L3 rule the halation scatter established (G17). The
-                // matte value comes from the SAME input alpha the pixels use.
+                           scat ? scat[j + 2] : 0.0f,
+                           vignGain(x, y, W, H, pr), pr, mr, mg, mb);
+                // Grain and bloom are part of the result, so the parade must
+                // measure them — the same L3 rule the halation scatter
+                // established (G17). The matte value comes from the SAME input
+                // alpha the pixels use, the bloom sample from the SAME field.
                 applyGrain(mr, mg, mb, src[i + 3], x, y, H, pr);
+                if (bscat)
+                    bloomApplyPixel(mr, mg, mb,
+                                    bscat[j + 0], bscat[j + 1], bscat[j + 2], pr);
                 const int col = wfColOf(x, W);
                 stats[wfIdx(0, col, wfRowOf(density10(mr)))]++;
                 stats[wfIdx(1, col, wfRowOf(density10(mg)))]++;
@@ -1068,8 +1358,10 @@ static inline void deliverInput(const SpeakParams& pr, float r, float g, float b
 // ---------------------------------------------------------------------------
 static inline void processPixel(float r, float g, float b, float srcA,
                                 float scatR, float scatG, float scatB,
+                                float bloomR, float bloomG, float bloomB,
                                 int x, int y, int W, int H,
                                 const SpeakParams& pr, const uint32_t* stats,
+                                int drawScopes,
                                 float& outR, float& outG, float& outB)
 {
     const SpeakProfile& p = pr.profile;
@@ -1078,19 +1370,23 @@ static inline void processPixel(float r, float g, float b, float srcA,
     const bool dyeOn   = (pr.enableDye != 0) && dyeActive(p);
     const bool splitOn = (pr.enableSplit != 0) && splitActive(p);
     const bool grainOn = grainActive(pr);
+    const bool bloomOn = bloomActive(pr);
+    const bool vignOn  = vignActive(pr);
     const bool bake    = (pr.outputMode == SPEAK_OUT_BAKE_REC709);
 
-    if (!toneOn && !dyeOn && !splitOn && !grainOn && !bake) {
+    if (!toneOn && !dyeOn && !splitOn && !grainOn && !bloomOn && !vignOn && !bake) {
         // Working space + no look: bit-exact pass-through (identity). Scopes
         // may still overwrite below. Halation cannot reach here: halActive()
         // requires toneOn, so this branch already excludes it.
         outR = r; outG = g; outB = b;
     } else {
         // The look in working-space linear (halation + tone spine + subtractive
-        // color + grain) — the SAME functions the density scope measures.
+        // color + grain + bloom) — the SAME functions the density scope measures.
         float mr, mg, mb;
-        lookLinear(r, g, b, scatR, scatG, scatB, pr, mr, mg, mb);
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, mr, mg, mb);
         applyGrain(mr, mg, mb, srcA, x, y, H, pr);
+        bloomApplyPixel(mr, mg, mb, bloomR, bloomG, bloomB, pr);
         if (bake) {
             // Output CST: gamut-convert to Rec.709 and encode gamma 2.4. Applies
             // regardless of the look (it is delivery, not a look) — a hard gamut
@@ -1155,7 +1451,8 @@ static inline void processPixel(float r, float g, float b, float srcA,
     // looks subtle, and the matte's placement (grainMatte) is directly visible.
     if (pr.viewMode == SPEAK_VIEW_GRAIN) {
         float pr0, pg0, pb0, pr1, pg1, pb1;
-        lookLinear(r, g, b, scatR, scatG, scatB, pr, pr0, pg0, pb0);
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, pr0, pg0, pb0);
         pr1 = pr0; pg1 = pg0; pb1 = pb0;
         applyGrain(pr1, pg1, pb1, srcA, x, y, H, pr);
         float gr = k18Gray + (pr1 - pr0);
@@ -1180,10 +1477,49 @@ static inline void processPixel(float r, float g, float b, float srcA,
         }
     }
 
-    // Scopes render last, over any view (each owns its own corner).
-    float sr, sg, sb;
-    if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
-    if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    // Isolated-bloom view: gray + the SIGNED bloom delta this pixel received
+    // (out - look). Bloom both gives and takes — the halo's lift is positive,
+    // the source's borrowed light is NEGATIVE — and showing the signed field
+    // on gray is what makes the conservation visible: the darkening at the
+    // source is the same light as the glow around it. Same honesty stance as
+    // the scatter and grain views: never auto-gained.
+    if (pr.viewMode == SPEAK_VIEW_BLOOM) {
+        float lr0, lg0, lb0, lr1, lg1, lb1;
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, lr0, lg0, lb0);
+        applyGrain(lr0, lg0, lb0, srcA, x, y, H, pr);
+        lr1 = lr0; lg1 = lg0; lb1 = lb0;
+        bloomApplyPixel(lr1, lg1, lb1, bloomR, bloomG, bloomB, pr);
+        float gr = k18Gray + (lr1 - lr0);
+        float gg = k18Gray + (lg1 - lg0);
+        float gb = k18Gray + (lb1 - lb0);
+        if (bake) {
+            float rr, rg, rb;
+            gamutToRec709Lin(cs, gr, gg, gb, rr, rg, rb);
+            gr = rr < 0.0f ? 0.0f : rr;
+            gg = rg < 0.0f ? 0.0f : rg;
+            gb = rb < 0.0f ? 0.0f : rb;
+            outR = encodeFromLinear(SPEAK_CS_REC709_G24, gr);
+            outG = encodeFromLinear(SPEAK_CS_REC709_G24, gg);
+            outB = encodeFromLinear(SPEAK_CS_REC709_G24, gb);
+        } else {
+            gr = gr < 0.0f ? 0.0f : gr;
+            gg = gg < 0.0f ? 0.0f : gg;
+            gb = gb < 0.0f ? 0.0f : gb;
+            outR = encodeFromLinear(cs, gr);
+            outG = encodeFromLinear(cs, gg);
+            outB = encodeFromLinear(cs, gb);
+        }
+    }
+
+    // Scopes render last, over any view (each owns its own corner). When the
+    // gate-weave pass is live, speakFrame suppresses them here and overlays
+    // them AFTER the displacement — panel chrome does not weave.
+    if (drawScopes != 0) {
+        float sr, sg, sb;
+        if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+        if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,9 +1542,11 @@ inline void buildHalScatter(const float* src, int W, int H, const SpeakParams& p
         for (int x = 0; x < W; ++x) {
             const size_t i = (static_cast<size_t>(y) * W + x) * 4;
             const size_t o = (static_cast<size_t>(y) * W + x) * 3;
-            arena[o + 0] = halExcess(decodeToLinear(cs, src[i + 0]), th);
-            arena[o + 1] = halExcess(decodeToLinear(cs, src[i + 1]), th);
-            arena[o + 2] = halExcess(decodeToLinear(cs, src[i + 2]), th);
+            // vignette first: light the lens never delivered cannot halate
+            const float vg = vignGain(x, y, W, H, pr);
+            arena[o + 0] = halExcess(vg * decodeToLinear(cs, src[i + 0]), th);
+            arena[o + 1] = halExcess(vg * decodeToLinear(cs, src[i + 1]), th);
+            arena[o + 2] = halExcess(vg * decodeToLinear(cs, src[i + 2]), th);
         }
     const int nLev = halLevelCount(W, H);
     for (int L = 1; L < nLev; ++L) {
@@ -1231,14 +1569,76 @@ inline void buildHalScatter(const float* src, int W, int H, const SpeakParams& p
         for (int y = 0; y < lh; ++y)
             for (int x = 0; x < lw; ++x) {
                 float v[3];
-                halAccumPixel(arena, W, H, L, nLev, sig, x, y, v);
+                halAccumPixel(arena, W, H, L, nLev, sig,
+                              kHalCoreFall, kHalSkirtFall, x, y, v);
                 const size_t o = (static_cast<size_t>(off) + static_cast<size_t>(y) * lw + x) * 3;
                 arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
             }
     }
     // Normalize level 0 into the scatter plane: sum(w) = 1 => energy preserved.
-    const float inv = 1.0f / halWeightSum(nLev, sig);
+    const float inv = 1.0f / halWeightSum(nLev, sig, kHalCoreFall, kHalSkirtFall);
     for (size_t k = 0; k < static_cast<size_t>(W) * H * 3; ++k) scat[k] = arena[k] * inv;
+}
+
+// Builds the BLOOM pyramid for a frame, on the LOOK's working-linear output
+// (`lookBuf`, W*H*3 — the image the projector sees, grain included). No
+// threshold, broader skirt, veil weight on the coarsest level; see the bloom
+// header block for why this is its own build rather than a re-read of
+// halation's scene-referred excess pyramid. Same arena contract as
+// buildHalScatter; only called when bloom is live — see speakFrame.
+inline void buildBloomScatter(const float* lookBuf, int W, int H, const SpeakParams& pr,
+                              float* arena, float* scat)
+{
+    const size_t n0 = static_cast<size_t>(W) * H * 3;
+    for (size_t k = 0; k < n0; ++k) arena[k] = lookBuf[k];
+    const int nLev = halLevelCount(W, H);
+    for (int L = 1; L < nLev; ++L) {
+        int sw, sh, so, dw, dh, doff;
+        halLevelInfo(W, H, L - 1, sw, sh, so);
+        halLevelInfo(W, H, L,     dw, dh, doff);
+        for (int y = 0; y < dh; ++y)
+            for (int x = 0; x < dw; ++x) {
+                float v[3];
+                halDecimatePixel(arena, so, sw, sh, x, y, v);
+                const size_t o = (static_cast<size_t>(doff) + static_cast<size_t>(y) * dw + x) * 3;
+                arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+            }
+    }
+    // The veil's source: the frame mean, i.e. the decimation chain taken to
+    // its logical end. Computed over the coarsest level BEFORE the in-place
+    // accumulate overwrites it (each level is mean-preserving, so this is the
+    // frame mean up to the border-clamp reweighting every level shares).
+    const float sig  = bloomSigmaPx(H, pr);
+    const float veil = bloomVeilAdd(nLev, sig, pr);
+    float meanC[3] = { 0.0f, 0.0f, 0.0f };
+    {
+        int cw, ch, coff;
+        halLevelInfo(W, H, nLev - 1, cw, ch, coff);
+        for (int y = 0; y < ch; ++y)
+            for (int x = 0; x < cw; ++x) {
+                const size_t o = (static_cast<size_t>(coff) + static_cast<size_t>(y) * cw + x) * 3;
+                meanC[0] += arena[o + 0]; meanC[1] += arena[o + 1]; meanC[2] += arena[o + 2];
+            }
+        const float invN = 1.0f / (static_cast<float>(cw) * static_cast<float>(ch));
+        meanC[0] *= invN; meanC[1] *= invN; meanC[2] *= invN;
+    }
+    for (int L = nLev - 1; L >= 0; --L) {
+        int lw, lh, off;
+        halLevelInfo(W, H, L, lw, lh, off);
+        for (int y = 0; y < lh; ++y)
+            for (int x = 0; x < lw; ++x) {
+                float v[3];
+                halAccumPixel(arena, W, H, L, nLev, sig,
+                              kHalCoreFall, kBloomSkirtFall, x, y, v);
+                const size_t o = (static_cast<size_t>(off) + static_cast<size_t>(y) * lw + x) * 3;
+                arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
+            }
+    }
+    // Normalize profile + veil together: S = (mixture + w_veil*mean) / (Sum w + w_veil).
+    const float base = halWeightSum(nLev, sig, kHalCoreFall, kBloomSkirtFall);
+    const float inv  = 1.0f / (base + veil);
+    for (size_t k = 0; k < n0; ++k)
+        scat[k] = (arena[k] + veil * meanC[k % 3]) * inv;
 }
 
 inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, float* dst)
@@ -1254,7 +1654,38 @@ inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, fl
         buildHalScatter(src, W, H, pr, arena.data(), scat.data());
     }
     const float* sc = hal ? scat.data() : nullptr;
-    computeStats(src, sc, W, H, pr, stats.data());   // measure the frame, then render
+
+    // Bloom scatters the LOOK's output (grain included), so its pyramid needs
+    // the look field first. The per-pixel look is recomputed in processPixel
+    // rather than read back from this buffer — a pure function of the same
+    // inputs, so the two cannot disagree, and the GPU ports keep the same
+    // shape (their main pass stays a pure per-pixel kernel).
+    std::vector<float> lookBuf, bloomScat;
+    const bool blm = bloomActive(pr);
+    if (blm) {
+        lookBuf.assign(static_cast<size_t>(W) * H * 3, 0.0f);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                const size_t j = (static_cast<size_t>(y) * W + x) * 3;
+                float lr, lg, lb;
+                lookLinear(src[i + 0], src[i + 1], src[i + 2],
+                           sc ? sc[j + 0] : 0.0f, sc ? sc[j + 1] : 0.0f,
+                           sc ? sc[j + 2] : 0.0f,
+                           vignGain(x, y, W, H, pr), pr, lr, lg, lb);
+                applyGrain(lr, lg, lb, src[i + 3], x, y, H, pr);
+                lookBuf[j + 0] = lr; lookBuf[j + 1] = lg; lookBuf[j + 2] = lb;
+            }
+        if (arena.empty())
+            arena.assign(static_cast<size_t>(halArenaPixels(W, H)) * 3, 0.0f);
+        bloomScat.assign(static_cast<size_t>(W) * H * 3, 0.0f);
+        buildBloomScatter(lookBuf.data(), W, H, pr, arena.data(), bloomScat.data());
+    }
+    const float* bs = blm ? bloomScat.data() : nullptr;
+
+    computeStats(src, sc, bs, W, H, pr, stats.data());   // measure the frame, then render
+    const bool weave = weaveActive(pr);
+    const int drawScopes = weave ? 0 : 1;
     for (int y = 0; y < H; ++y) {
         for (int x = 0; x < W; ++x) {
             const size_t i = (static_cast<size_t>(y) * W + x) * 4;
@@ -1262,11 +1693,40 @@ inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, fl
             float oR, oG, oB;
             processPixel(src[i + 0], src[i + 1], src[i + 2], src[i + 3],
                          sc ? sc[j + 0] : 0.0f, sc ? sc[j + 1] : 0.0f, sc ? sc[j + 2] : 0.0f,
-                         x, y, W, H, pr, stats.data(), oR, oG, oB);
+                         bs ? bs[j + 0] : 0.0f, bs ? bs[j + 1] : 0.0f, bs ? bs[j + 2] : 0.0f,
+                         x, y, W, H, pr, stats.data(), drawScopes, oR, oG, oB);
             dst[i + 0] = oR;
             dst[i + 1] = oG;
             dst[i + 2] = oB;
             dst[i + 3] = src[i + 3];   // alpha passes through (the matte survives Speak)
+        }
+    }
+    if (weave) {
+        // The gate displaces the finished picture — grain, bloom and all —
+        // as one rigid sub-pixel move; then the scopes are drawn on top,
+        // pinned (they are panel chrome, not picture).
+        float wdx, wdy;
+        weaveDisp(pr, H, wdx, wdy);
+        std::vector<float> pre(dst, dst + static_cast<size_t>(W) * H * 4);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                weaveSamplePixel(pre.data(), W, H,
+                                 static_cast<float>(x) - wdx,
+                                 static_cast<float>(y) - wdy, &dst[i]);
+            }
+        if (pr.scopeHD != 0 || pr.scopeDensity != 0) {
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                    float sr, sg, sb;
+                    if (hdScopePixel(x, y, W, H, pr, stats.data(), sr, sg, sb)) {
+                        dst[i + 0] = sr; dst[i + 1] = sg; dst[i + 2] = sb;
+                    }
+                    if (densityScopePixel(x, y, W, H, pr, stats.data(), sr, sg, sb)) {
+                        dst[i + 0] = sr; dst[i + 1] = sg; dst[i + 2] = sb;
+                    }
+                }
         }
     }
 }
@@ -1307,6 +1767,17 @@ static inline SpeakProfile neutralProfile()
     // is a fine-grain pitch of 0.10% of frame height (~1.1 px at 1080p, ~2.2 px
     // at UHD — the same physical size on the frame at both, which is the point).
     p.grainAmount = 0.0f; p.grainSize = 0.10f;
+    // Bloom: OFF by default (amount 0 => bit-exact identity). Radius and veil
+    // are MODELLED defaults for a clean projection path — a wider spread than
+    // halation's base-reflection ring (glare comes from the whole optical
+    // train) and a small veil share. No lens was measured; the hints say so.
+    p.bloomAmount = 0.0f; p.bloomRadius = 4.0f; p.bloomVeil = 0.10f;
+    // Vignette: OFF by default. The field default is a normal lens's
+    // half-diagonal (~27 deg); MODELLED, the hint says so.
+    p.vignAmount = 0.0f; p.vignField = 27.0f;
+    // Gate weave: OFF by default. Amplitude default when enabled is small on
+    // purpose (0.05% of height ~ 0.5px at 1080p); MODELLED.
+    p.weaveAmount = 0.0f; p.weaveSpeed = 1.0f;
     p.systemGamma = 1.6f; p.residualLUT = 0; p.profileVersion = 1; p._pad0 = 0;
     return p;
 }

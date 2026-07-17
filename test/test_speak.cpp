@@ -37,12 +37,12 @@ static void gateLayout()
 {
     printf("G1 struct layout parity\n");
     // All-4-byte-field invariant: sizeof must equal the field count * 4.
-    const size_t profFields = 72;   // see SpeakParams.h; keep in sync (+3 halation +2 grain)
+    const size_t profFields = 79;   // see SpeakParams.h; keep in sync (+3 hal +2 grain +3 bloom +2 vign +2 weave)
     const size_t parFields  = 16 + profFields;   // +3 grain pipeline controls
     check(sizeof(float) == 4 && sizeof(int) == 4, "float/int are 4 bytes");
-    check(sizeof(SpeakProfile) == profFields * 4, "sizeof(SpeakProfile)==288",
+    check(sizeof(SpeakProfile) == profFields * 4, "sizeof(SpeakProfile)==316",
           (std::to_string(sizeof(SpeakProfile))).c_str());
-    check(sizeof(SpeakParams) == parFields * 4, "sizeof(SpeakParams)==352",
+    check(sizeof(SpeakParams) == parFields * 4, "sizeof(SpeakParams)==380",
           (std::to_string(sizeof(SpeakParams))).c_str());
     check(offsetof(SpeakParams, profile) == 16 * 4, "profile offset==64",
           (std::to_string(offsetof(SpeakParams, profile))).c_str());
@@ -50,6 +50,14 @@ static void gateLayout()
     check(offsetof(SpeakProfile, printerLights) == 18 * 4, "printerLights offset==72");
     check(offsetof(SpeakProfile, prnDmin) == 22 * 4, "prnDmin offset==88");
     check(offsetof(SpeakProfile, dyeCouple) == 40 * 4, "dyeCouple offset==160");
+    check(offsetof(SpeakProfile, bloomAmount) == 68 * 4, "bloomAmount offset==272",
+          (std::to_string(offsetof(SpeakProfile, bloomAmount))).c_str());
+    check(offsetof(SpeakProfile, vignAmount) == 71 * 4, "vignAmount offset==284",
+          (std::to_string(offsetof(SpeakProfile, vignAmount))).c_str());
+    check(offsetof(SpeakProfile, weaveAmount) == 73 * 4, "weaveAmount offset==292",
+          (std::to_string(offsetof(SpeakProfile, weaveAmount))).c_str());
+    check(offsetof(SpeakProfile, systemGamma) == 75 * 4, "systemGamma offset==300",
+          (std::to_string(offsetof(SpeakProfile, systemGamma))).c_str());
 }
 
 // ------------------------------------------------------------ G2 round-trip
@@ -193,7 +201,7 @@ static void gateScopeMatchesKernel()
             const float lin = k18Gray * std::exp2(inStops);
             const float enc = diEncode(lin);
             float oR, oG, oB;
-            processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB); // the REAL pixel path
+            processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats, 1, oR, oG, oB); // the REAL pixel path
             for (int ch = 0; ch < 3; ++ch) {
                 const float scopeOut = scopeYStops(inStops, ch, pr);
                 const float outCh = (ch == 0) ? oR : (ch == 1) ? oG : oB;
@@ -225,7 +233,7 @@ static void gateBakeCST()
         const float lin = std::pow(10.0f, -3.0f + 5.0f * (i / 400.0f));
         const float enc = diEncode(lin);
         float oR, oG, oB;
-        processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
+        processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats, 1, oR, oG, oB);
         maxChroma = std::fmax(maxChroma, std::fmax(std::fabs(oR - oG), std::fabs(oG - oB)));
     }
     check(maxChroma < 2e-3f, "DWG neutral bakes to Rec.709 neutral",
@@ -235,7 +243,7 @@ static void gateBakeCST()
     {
         const float enc = diEncode(k18Gray);
         float oR, oG, oB;
-        processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
+        processPixel(enc, enc, enc, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats, 1, oR, oG, oB);
         const float expect = std::pow(k18Gray, 1.0f / 2.4f);
         check(std::fabs(oR - expect) < 3e-3f, "18% gray -> correct Rec.709 code",
               (std::string("got=") + std::to_string(oR) + " want=" + std::to_string(expect)).c_str());
@@ -283,22 +291,22 @@ static void gateViewDelivery()
     pr.viewMode = SPEAK_VIEW_INPUT;
     pr.profile = neutralProfile();
     float oR, oG, oB;
-    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
+    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats, 1, oR, oG, oB);
     check(std::fabs(oR - rec709Gray) < 3e-3f, "bake+Input shows input in Rec.709",
           (std::string("got=") + std::to_string(oR) + " want=" + std::to_string(rec709Gray)).c_str());
     check(std::fabs(oR - encGray) > 0.1f, "bake+Input is NOT the raw DI buffer");
 
     // Working + Input view: bit-exact raw input pass-through.
     pr.outputMode = SPEAK_OUT_WORKING;
-    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats,oR, oG, oB);
+    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 4, 4, 100, 100, pr, kNoStats, 1, oR, oG, oB);
     check(oR == encGray, "working+Input is bit-exact raw input");
 
     // Bake + Split: left half (input) and right half (result) share Rec.709 —
     // the left-half pixel equals the delivered input, the right-half is baked.
     pr.outputMode = SPEAK_OUT_BAKE_REC709; pr.viewMode = SPEAK_VIEW_SPLIT;
     float lR, lG, lB, rR, rG, rB;
-    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 10, 4, 100, 100, pr, kNoStats,lR, lG, lB);  // x<W/2 -> input
-    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 90, 4, 100, 100, pr, kNoStats,rR, rG, rB);  // x>=W/2 -> result
+    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 10, 4, 100, 100, pr, kNoStats, 1, lR, lG, lB);  // x<W/2 -> input
+    processPixel(encGray, encGray, encGray, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 90, 4, 100, 100, pr, kNoStats, 1, rR, rG, rB);  // x>=W/2 -> result
     check(std::fabs(lR - rec709Gray) < 3e-3f, "bake+Split left half is delivered input (Rec.709)");
     check(std::fabs(rR - rec709Gray) < 6e-3f, "bake+Split right half is result (Rec.709, same space)");
 }
@@ -531,7 +539,8 @@ static void gateHalEnergy()
     // is load-bearing by checking the weights actually sum to something != 1.
     float wsum = 0.0f;
     const int nLev = halLevelCount(W, H);
-    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, halSigmaPx(H, pr));
+    for (int L = 0; L < nLev; ++L)
+        wsum += halLevelWeight(L, halSigmaPx(H, pr), kHalCoreFall, kHalSkirtFall);
     check(wsum > 1.5f, "G14b the raw level weights do NOT sum to 1 (so G14a is a real gate)",
           (std::string("raw wsum=") + std::to_string(wsum)).c_str());
 }
@@ -677,8 +686,8 @@ static void gateHalMaxlevNeverBinds()
         const float sig = halSigmaPx(H, pr);
         const int n = halLevelCount(W, H);
         float avail = 0.0f, full = 0.0f;
-        for (int L = 0; L < n; ++L)  avail += halLevelWeight(L, sig);
-        for (int L = 0; L < 20; ++L) full += halLevelWeight(L, sig);
+        for (int L = 0; L < n; ++L)  avail += halLevelWeight(L, sig, kHalCoreFall, kHalSkirtFall);
+        for (int L = 0; L < 20; ++L) full += halLevelWeight(L, sig, kHalCoreFall, kHalSkirtFall);
         const double carried = avail / full;
         printf("    %5dx%-5d nLev=%2d  carries %.1f%% of the mixture's weight\n",
                W, H, n, carried * 100.0);
@@ -712,8 +721,8 @@ static void gateHalScopeSeesScatter()
     buildHalScatter(src.data(), W, H, pr, arena.data(), scat.data());
 
     std::vector<uint32_t> withScat(SPEAK_STATS_UINTS), blind(SPEAK_STATS_UINTS);
-    computeStats(src.data(), scat.data(), W, H, pr, withScat.data());
-    computeStats(src.data(), nullptr,     W, H, pr, blind.data());   // the bug, simulated
+    computeStats(src.data(), scat.data(), nullptr, W, H, pr, withScat.data());
+    computeStats(src.data(), nullptr,     nullptr, W, H, pr, blind.data());   // the bug, simulated
     int diff = 0;
     for (int k = 0; k < SPEAK_WF_COLS * SPEAK_WF_ROWS * 3; ++k)
         if (withScat[SPEAK_STATS_WF + k] != blind[SPEAK_STATS_WF + k]) diff++;
@@ -977,6 +986,551 @@ static void gateGrainStructure()
           (std::string("mean=") + std::to_string(coarse.second)).c_str());
 }
 
+// =========================================================================
+// BLOOM GATES (G25-G31). The module's claims, each measured; the control-arm
+// duties live inside them: G26 proves the ADDITIVE strawman (video-game
+// screen bloom) fails conservation by construction, and G29 pins the veil's
+// lerp structure — the frame-luminance floor a plain Gaussian mix cannot
+// produce at any sigma.
+// =========================================================================
+static SpeakParams bloomParams(float amount, float radiusPct, float veil)
+{
+    SpeakParams pr = {};
+    pr.inputColorSpace = SPEAK_CS_LINEAR;   // identity spine: bloom acts on raw linear
+    pr.outputMode = SPEAK_OUT_WORKING;
+    pr.strength = 1.0f;
+    pr.viewMode = SPEAK_VIEW_RESULT;
+    pr.enableTone = 0; pr.enableDye = 0; pr.enableSplit = 0; pr.enableOptics = 1;
+    pr.profile = neutralProfile();
+    pr.profile.halAmount = 0.0f;
+    pr.profile.bloomAmount = amount;
+    pr.profile.bloomRadius = radiusPct;
+    pr.profile.bloomVeil   = veil;
+    return pr;
+}
+
+// Interior disc scene: RGBA, dark floor + a bright disc at centre, zero near
+// the borders so clamp-to-edge losses stay out of the energy ledger.
+static void bloomScene(std::vector<float>& img, int W, int H,
+                       float discR, float floorLin,
+                       float vr, float vg, float vb)
+{
+    img.assign(static_cast<size_t>(W) * H * 4, 0.0f);
+    const float cx = W * 0.5f, cy = H * 0.5f;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const float dx = x - cx, dy = y - cy;
+            const bool in = (dx * dx + dy * dy) <= discR * discR;
+            img[i + 0] = in ? vr : floorLin;
+            img[i + 1] = in ? vg : floorLin;
+            img[i + 2] = in ? vb : floorLin;
+            img[i + 3] = 1.0f;
+        }
+}
+
+static double frameEnergy(const std::vector<float>& img)
+{
+    double s = 0.0;
+    for (size_t k = 0; k < img.size(); k += 4)
+        s += static_cast<double>(img[k]) + img[k + 1] + img[k + 2];
+    return s;
+}
+
+static void gateBloomIdentity()
+{
+    printf("G25 bloom identity + the enable gates\n");
+    const int W = 96, H = 64;
+    std::vector<float> src, a, b;
+    bloomScene(src, W, H, 6.0f, 0.05f, 2.0f, 2.0f, 2.0f);
+    a.resize(src.size()); b.resize(src.size());
+
+    // amount 0 == a params block with the whole optics group disabled, with a
+    // REAL look running (tone on): the bloom branch must be provably dead.
+    SpeakParams p1 = bloomParams(0.0f, 4.0f, 0.5f);
+    p1.enableTone = 1; p1.inputColorSpace = SPEAK_CS_DWG_INTERMEDIATE;
+    SpeakParams p2 = p1; p2.enableOptics = 0;
+    speakFrame(src.data(), W, H, p1, a.data());
+    speakFrame(src.data(), W, H, p2, b.data());
+    check(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
+          "G25a amount=0 is bit-exact (vs optics group off, look running)");
+
+    // enableOptics=0 kills a live amount; strength=0 kills it too.
+    SpeakParams p3 = bloomParams(0.8f, 4.0f, 0.3f); p3.enableOptics = 0;
+    speakFrame(src.data(), W, H, p3, a.data());
+    check(std::memcmp(a.data(), src.data(), a.size() * sizeof(float)) == 0,
+          "G25b enableOptics=0 -> bit-exact pass-through (linear identity spine)");
+    SpeakParams p4 = bloomParams(0.8f, 4.0f, 0.3f); p4.strength = 0.0f;
+    speakFrame(src.data(), W, H, p4, a.data());
+    check(std::memcmp(a.data(), src.data(), a.size() * sizeof(float)) == 0,
+          "G25c strength=0 -> bit-exact pass-through");
+}
+
+static void gateBloomEnergy()
+{
+    printf("G26 bloom conserves total linear energy (and the additive strawman does not)\n");
+    const int W = 192, H = 128;
+    std::vector<float> src, dst;
+    // disc sigma at radius 2% of H = 2.56 px; keep everything >= 8 sigma from
+    // borders so decimation clamp losses stay negligible in the ledger.
+    bloomScene(src, W, H, 5.0f, 0.02f, 4.0f, 4.0f, 4.0f);
+    dst.resize(src.size());
+    const double e0 = frameEnergy(src);
+
+    const float configs[][3] = { {1.0f, 2.0f, 0.0f}, {0.5f, 2.0f, 0.0f},
+                                 {1.0f, 6.0f, 0.0f}, {1.0f, 2.0f, 0.5f},
+                                 {0.7f, 4.0f, 0.9f} };
+    for (int k = 0; k < 5; ++k) {
+        SpeakParams pr = bloomParams(configs[k][0], configs[k][1], configs[k][2]);
+        speakFrame(src.data(), W, H, pr, dst.data());
+        const double e1 = frameEnergy(dst);
+        const double rel = std::fabs(e1 - e0) / e0;
+        char label[128];
+        std::snprintf(label, sizeof label,
+                      "G26a energy conserved (a=%.1f r=%.0f%% v=%.1f) rel=%.5f",
+                      configs[k][0], configs[k][1], configs[k][2], rel);
+        check(rel < 0.02, label, (std::string("rel=") + std::to_string(rel)).c_str());
+    }
+
+    // THE STRAWMAN MUST FAIL. Additive screen bloom (out = L + a*S) — the
+    // model this module deliberately is not — violates the ledger by roughly
+    // the whole scattered fraction. If this ever PASSES the same tolerance,
+    // the energy gate has lost its teeth.
+    {
+        SpeakParams pr = bloomParams(1.0f, 2.0f, 0.0f);
+        std::vector<float> lookBuf(static_cast<size_t>(W) * H * 3),
+                           arena(static_cast<size_t>(halArenaPixels(W, H)) * 3),
+                           scat(static_cast<size_t>(W) * H * 3);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                const size_t j = (static_cast<size_t>(y) * W + x) * 3;
+                lookBuf[j + 0] = src[i + 0]; lookBuf[j + 1] = src[i + 1]; lookBuf[j + 2] = src[i + 2];
+            }
+        buildBloomScatter(lookBuf.data(), W, H, pr, arena.data(), scat.data());
+        double eAdd = 0.0;
+        for (size_t j = 0; j < scat.size(); ++j) eAdd += lookBuf[j] + scat[j]; // out = L + 1.0*S
+        const double relAdd = std::fabs(eAdd - e0) / e0;
+        check(relAdd > 0.5, "G26b the ADDITIVE strawman fails the same ledger (gate has teeth)",
+              (std::string("additive rel=") + std::to_string(relAdd)).c_str());
+    }
+}
+
+static void gateBloomBorrow()
+{
+    printf("G27 bloom borrows: source dims, surround lifts\n");
+    const int W = 192, H = 128;
+    std::vector<float> src, dst;
+    bloomScene(src, W, H, 5.0f, 0.02f, 4.0f, 4.0f, 4.0f);
+    dst.resize(src.size());
+    SpeakParams pr = bloomParams(0.6f, 2.0f, 0.0f);
+    speakFrame(src.data(), W, H, pr, dst.data());
+    const float sig = bloomSigmaPx(H, pr);
+    const float cx = W * 0.5f, cy = H * 0.5f;
+    const size_t ic = (static_cast<size_t>(cy) * W + static_cast<size_t>(cx)) * 4;
+    check(dst[ic] < src[ic], "G27a the disc centre LOST light (borrowed, not copied)",
+          (std::to_string(src[ic]) + " -> " + std::to_string(dst[ic])).c_str());
+    double lift = 0.0; int n = 0;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float dx = x - cx, dy = y - cy;
+            const float r = std::sqrt(dx * dx + dy * dy);
+            if (r > 5.0f + sig && r < 5.0f + 3.0f * sig) {
+                const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                lift += dst[i] - src[i]; n++;
+            }
+        }
+    check(n > 0 && lift / n > 1e-4, "G27b the annulus GAINED the borrowed light",
+          (std::string("mean lift=") + std::to_string(n ? lift / n : 0.0)).c_str());
+}
+
+static void gateBloomNeutral()
+{
+    printf("G28 bloom is spectrally neutral (a blue lamp blooms BLUE — halation's inverse)\n");
+    const int W = 192, H = 128;
+    std::vector<float> src, dst;
+    bloomScene(src, W, H, 5.0f, 0.01f, 0.0f, 0.0f, 4.0f);   // saturated blue disc
+    dst.resize(src.size());
+    SpeakParams pr = bloomParams(0.8f, 2.0f, 0.0f);
+    speakFrame(src.data(), W, H, pr, dst.data());
+    const float sig = bloomSigmaPx(H, pr);
+    const float cx = W * 0.5f, cy = H * 0.5f;
+    double liftR = 0.0, liftB = 0.0;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const float dx = x - cx, dy = y - cy;
+            const float r = std::sqrt(dx * dx + dy * dy);
+            if (r > 5.0f + sig && r < 5.0f + 3.0f * sig) {
+                const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                liftR += dst[i + 0] - src[i + 0];
+                liftB += dst[i + 2] - src[i + 2];
+            }
+        }
+    check(liftB > 0.0 && liftB > 20.0 * std::fabs(liftR),
+          "G28 blue halo, no red tint (glass has no AH layer)",
+          (std::string("liftB/liftR=") + std::to_string(liftR != 0.0 ? liftB / liftR : 1e9)).c_str());
+}
+
+static void gateBloomVeil()
+{
+    printf("G29 the veiling floor: exact lerp structure + luminance-scaled black lift\n");
+    const int W = 192, H = 128;
+    std::vector<float> src;
+    bloomScene(src, W, H, 5.0f, 0.02f, 4.0f, 4.0f, 4.0f);
+    std::vector<float> lookBuf(static_cast<size_t>(W) * H * 3),
+                       arena(static_cast<size_t>(halArenaPixels(W, H)) * 3),
+                       s0(static_cast<size_t>(W) * H * 3),
+                       s25(static_cast<size_t>(W) * H * 3),
+                       s50(static_cast<size_t>(W) * H * 3);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const size_t j = (static_cast<size_t>(y) * W + x) * 3;
+            lookBuf[j + 0] = src[i + 0]; lookBuf[j + 1] = src[i + 1]; lookBuf[j + 2] = src[i + 2];
+        }
+    buildBloomScatter(lookBuf.data(), W, H, bloomParams(1, 2, 0.00f), arena.data(), s0.data());
+    buildBloomScatter(lookBuf.data(), W, H, bloomParams(1, 2, 0.25f), arena.data(), s25.data());
+    buildBloomScatter(lookBuf.data(), W, H, bloomParams(1, 2, 0.50f), arena.data(), s50.data());
+    // S_v = (1-v)*S_0 + v*C with C independent of v: recover C from two veil
+    // settings and demand they agree pixel-for-pixel. This pins "bloomVeil is
+    // the veil's SHARE" as arithmetic, not vibes.
+    float maxDiff = 0.0f, maxC = 0.0f;
+    for (size_t j = 0; j < s0.size(); ++j) {
+        const float c25 = (s25[j] - 0.75f * s0[j]) / 0.25f;
+        const float c50 = (s50[j] - 0.50f * s0[j]) / 0.50f;
+        maxDiff = std::fmax(maxDiff, std::fabs(c25 - c50));
+        maxC = std::fmax(maxC, std::fabs(c50));
+    }
+    check(maxDiff < 1e-4f * std::fmax(maxC, 1.0f),
+          "G29a S_v == (1-v)S_0 + v*C exactly (C the coarsest level)",
+          (std::string("max residual=") + std::to_string(maxDiff)).c_str());
+    // The far floor rises with v (black-lift), and the veil light scales with
+    // the frame's own luminance: doubling the scene doubles C.
+    const size_t far0 = (static_cast<size_t>(4) * W + 4) * 3;
+    check(s50[far0] > s0[far0] + 1e-5f, "G29b far-corner floor rises with veil",
+          (std::to_string(s0[far0]) + " -> " + std::to_string(s50[far0])).c_str());
+    std::vector<float> look2(lookBuf);
+    for (size_t j = 0; j < look2.size(); ++j) look2[j] *= 2.0f;
+    std::vector<float> s50x2(s50.size());
+    buildBloomScatter(look2.data(), W, H, bloomParams(1, 2, 0.50f), arena.data(), s50x2.data());
+    const float ratio = s50x2[far0] / std::fmax(s50[far0], 1e-9f);
+    check(std::fabs(ratio - 2.0f) < 1e-3f,
+          "G29c the veil scales with frame luminance (x2 scene -> x2 floor)",
+          (std::string("ratio=") + std::to_string(ratio)).c_str());
+}
+
+static void gateBloomResolution()
+{
+    printf("G30 bloom radius is format-relative (proxy holds its scale)\n");
+    // Same fractional scene at two sizes; compare the annulus lift profile at
+    // matched FRACTIONAL radii (the G16 contract, applied to the bloom read).
+    const int sizes[2][2] = { {480, 270}, {960, 540} };
+    double prof[2][3];
+    for (int s = 0; s < 2; ++s) {
+        const int W = sizes[s][0], H = sizes[s][1];
+        std::vector<float> src, dst;
+        bloomScene(src, W, H, 0.02f * H, 0.02f, 4.0f, 4.0f, 4.0f);
+        dst.resize(src.size());
+        SpeakParams pr = bloomParams(0.8f, 3.0f, 0.2f);
+        speakFrame(src.data(), W, H, pr, dst.data());
+        const float cx = W * 0.5f, cy = H * 0.5f;
+        const float fr[3] = { 0.05f, 0.10f, 0.20f };   // fractions of H
+        for (int k = 0; k < 3; ++k) {
+            double lift = 0.0; int n = 0;
+            const float rLo = fr[k] * H * 0.9f, rHi = fr[k] * H * 1.1f;
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float dx = x - cx, dy = y - cy;
+                    const float r = std::sqrt(dx * dx + dy * dy);
+                    if (r >= rLo && r <= rHi) {
+                        const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                        lift += dst[i] - src[i]; n++;
+                    }
+                }
+            prof[s][k] = n ? lift / n : 0.0;
+        }
+    }
+    for (int k = 0; k < 3; ++k) {
+        const double rel = std::fabs(prof[0][k] - prof[1][k]) /
+                           std::fmax(std::fabs(prof[1][k]), 1e-9);
+        char label[96];
+        std::snprintf(label, sizeof label,
+                      "G30 lift at r=%d%%H matches across 2x resolution (rel=%.3f)",
+                      static_cast<int>((k == 0 ? 5 : k == 1 ? 10 : 20)), rel);
+        check(rel < 0.10, label);
+    }
+}
+
+static void gateBloomScopeSeesBloom()
+{
+    printf("G31 the density parade measures bloom (the L3 rule, third module)\n");
+    const int W = 192, H = 128;
+    std::vector<float> src;
+    bloomScene(src, W, H, 8.0f, 0.02f, 4.0f, 4.0f, 4.0f);
+    SpeakParams pr = bloomParams(1.0f, 4.0f, 0.5f);
+    pr.scopeDensity = 1;
+    std::vector<float> lookBuf(static_cast<size_t>(W) * H * 3),
+                       arena(static_cast<size_t>(halArenaPixels(W, H)) * 3),
+                       scat(static_cast<size_t>(W) * H * 3);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            const size_t j = (static_cast<size_t>(y) * W + x) * 3;
+            lookBuf[j + 0] = src[i + 0]; lookBuf[j + 1] = src[i + 1]; lookBuf[j + 2] = src[i + 2];
+        }
+    buildBloomScatter(lookBuf.data(), W, H, pr, arena.data(), scat.data());
+    std::vector<uint32_t> withB(SPEAK_STATS_UINTS), blind(SPEAK_STATS_UINTS);
+    computeStats(src.data(), nullptr, scat.data(), W, H, pr, withB.data());
+    computeStats(src.data(), nullptr, nullptr,     W, H, pr, blind.data());
+    int diff = 0;
+    for (int k = 0; k < SPEAK_WF_COLS * SPEAK_WF_ROWS * 3; ++k)
+        if (withB[SPEAK_STATS_WF + k] != blind[SPEAK_STATS_WF + k]) diff++;
+    check(diff > 0, "G31 a bloom-blind parade differs (so the wiring is load-bearing)",
+          (std::string("cells differing=") + std::to_string(diff)).c_str());
+}
+
+// =========================================================================
+// VIGNETTE GATES (G32-G34): closed-form cos^4, injection site, halation
+// coupling. WEAVE GATES (G35-G39): identity/determinism, Catmull-Rom
+// correctness, displacement statistics, pinned scopes, parade stability.
+// =========================================================================
+static void gateVignette()
+{
+    printf("G32 vignette: identity, closed form, symmetry\n");
+    const int W = 192, H = 108;
+    SpeakParams pr = bloomParams(0.0f, 4.0f, 0.0f);   // linear identity spine
+    pr.profile.vignAmount = 0.0f;
+    std::vector<float> src, dst;
+    bloomScene(src, W, H, 8.0f, 0.10f, 1.0f, 1.0f, 1.0f);
+    dst.resize(src.size());
+    speakFrame(src.data(), W, H, pr, dst.data());
+    check(std::memcmp(dst.data(), src.data(), src.size() * sizeof(float)) == 0,
+          "G32a amount=0 is bit-exact pass-through");
+
+    pr.profile.vignAmount = 1.0f; pr.profile.vignField = 27.0f;
+    // centre gain is exactly 1 at ANY amount (r=0 -> cos^4(0)=1)
+    const float gc = vignGain(W / 2, H / 2, W + 1, H + 1, pr); // odd dims: exact centre
+    check(std::fabs(gc - 1.0f) < 1e-6f, "G32b centre gain == 1 exactly",
+          (std::to_string(gc)).c_str());
+    // corner matches the closed form
+    const float t = std::tan(27.0f * 0.017453293f);
+    const float c2 = 1.0f / (1.0f + t * t);
+    const float want = c2 * c2;
+    const float g00 = vignGain(0, 0, W, H, pr);
+    check(std::fabs(g00 - want) < 1e-5f, "G32c corner gain == cos^4(field) closed form",
+          (std::to_string(g00) + " want " + std::to_string(want)).c_str());
+    // four corners identical (radial symmetry), monotone along the top row
+    const float g10 = vignGain(W - 1, 0, W, H, pr);
+    const float g01 = vignGain(0, H - 1, W, H, pr);
+    const float g11 = vignGain(W - 1, H - 1, W, H, pr);
+    check(std::fabs(g00 - g10) < 1e-6f && std::fabs(g00 - g01) < 1e-6f &&
+          std::fabs(g00 - g11) < 1e-6f, "G32d four corners identical");
+    bool mono = true;
+    for (int x = 1; x <= W / 2; ++x)
+        if (vignGain(x, H / 2, W, H, pr) < vignGain(x - 1, H / 2, W, H, pr) - 1e-7f)
+            mono = false;
+    check(mono, "G32e gain rises monotonically toward centre");
+}
+
+static void gateVignetteSite()
+{
+    printf("G33 vignette sits BEFORE the curve (corners ride the toe)\n");
+    // The claim as arithmetic: a corner pixel through the full look must
+    // equal a centre pixel whose SCENE light was pre-scaled by the same
+    // gain. Only a pre-curve injection site has that property; a post-look
+    // dim would fail it on any nonlinear curve.
+    SpeakParams pr = {};
+    pr.inputColorSpace = SPEAK_CS_LINEAR;
+    pr.outputMode = SPEAK_OUT_WORKING;
+    pr.strength = 1.0f;
+    pr.enableTone = 1; pr.enableOptics = 1;
+    pr.profile = neutralProfile();
+    pr.profile.vignAmount = 0.8f;
+    const int W = 200, H = 120;
+    float maxErr = 0.0f;
+    for (int k = 0; k < 20; ++k) {
+        const float lin = 0.02f * std::pow(1.5f, static_cast<float>(k));
+        const float g = vignGain(3, 5, W, H, pr);     // a deep corner pixel
+        float aR, aG, aB, bR, bG, bB;
+        lookLinear(lin, lin, lin, 0, 0, 0, g,   pr, aR, aG, aB);
+        lookLinear(g * lin, g * lin, g * lin, 0, 0, 0, 1.0f, pr, bR, bG, bB);
+        maxErr = std::fmax(maxErr, std::fabs(aR - bR));
+    }
+    check(maxErr < 1e-6f, "G33 corner == centre with pre-scaled scene light",
+          (std::string("max err ") + std::to_string(maxErr)).c_str());
+}
+
+static void gateVignetteHalation()
+{
+    printf("G34 light the lens never delivered cannot halate\n");
+    // A corner highlight under heavy vignette must scatter LESS than the
+    // same highlight at centre — the excess is extracted from vignetted
+    // light. Compare total scatter energy of one disc placed both ways.
+    const int W = 192, H = 128;
+    SpeakParams pr = halParams(SPEAK_CS_LINEAR, 1.0f, 2.0f, 0.6f);
+    pr.profile.vignAmount = 1.0f; pr.profile.vignField = 40.0f;
+    std::vector<float> arena(static_cast<size_t>(halArenaPixels(W, H)) * 3),
+                       scat(static_cast<size_t>(W) * H * 3);
+    double e[2];
+    for (int mode = 0; mode < 2; ++mode) {
+        std::vector<float> img(static_cast<size_t>(W) * H * 4, 0.0f);
+        const int cx = mode == 0 ? W / 2 : 6, cy = mode == 0 ? H / 2 : 6;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+                const bool in = (x - cx) * (x - cx) + (y - cy) * (y - cy) <= 16;
+                img[i] = img[i + 1] = img[i + 2] = in ? 4.0f : 0.0f;
+                img[i + 3] = 1.0f;
+            }
+        buildHalScatter(img.data(), W, H, pr, arena.data(), scat.data());
+        double s = 0.0;
+        for (size_t k = 0; k < scat.size(); ++k) s += scat[k];
+        e[mode] = s;
+    }
+    check(e[1] < 0.6 * e[0], "G34 corner disc scatters less than centre disc",
+          (std::to_string(e[1]) + " vs " + std::to_string(e[0])).c_str());
+}
+
+static void gateWeaveIdentity()
+{
+    printf("G35 weave: identity, determinism, view discipline\n");
+    const int W = 160, H = 96;
+    std::vector<float> src, a, b;
+    bloomScene(src, W, H, 7.0f, 0.05f, 2.0f, 1.0f, 0.5f);
+    a.resize(src.size()); b.resize(src.size());
+    SpeakParams pr = bloomParams(0.0f, 4.0f, 0.0f);
+    pr.profile.weaveAmount = 0.0f;
+    speakFrame(src.data(), W, H, pr, a.data());
+    check(std::memcmp(a.data(), src.data(), a.size() * sizeof(float)) == 0,
+          "G35a amount=0 is bit-exact pass-through");
+
+    pr.profile.weaveAmount = 0.3f; pr.frameIndex = 137;
+    speakFrame(src.data(), W, H, pr, a.data());
+    speakFrame(src.data(), W, H, pr, b.data());
+    check(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
+          "G35b same frame index -> bit-identical output (deterministic)");
+    check(std::memcmp(a.data(), src.data(), a.size() * sizeof(float)) != 0,
+          "G35c the picture actually moved (weave is not a no-op)");
+
+    // alpha moved WITH the picture: displaced alpha equals a reference
+    // resample of the source alpha plane
+    float wdx, wdy; weaveDisp(pr, H, wdx, wdy);
+    float ref[4];
+    weaveSamplePixel(src.data(), W, H, 40.0f - wdx, 50.0f - wdy, ref);
+    const size_t ip = (static_cast<size_t>(50) * W + 40) * 4;
+    check(std::fabs(a[ip + 3] - ref[3]) < 1e-6f, "G35d alpha rides with the picture");
+
+    // diagnostics hold still: the isolated views are not displaced
+    pr.viewMode = SPEAK_VIEW_INPUT;
+    speakFrame(src.data(), W, H, pr, a.data());
+    pr.profile.weaveAmount = 0.0f;
+    speakFrame(src.data(), W, H, pr, b.data());
+    check(std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0,
+          "G35e Input view is pinned (weave is RESULT-only)");
+}
+
+static void gateWeaveCR()
+{
+    printf("G36 Catmull-Rom: partition of unity, exact on linear ramps\n");
+    const int W = 64, H = 48;
+    std::vector<float> img(static_cast<size_t>(W) * H * 4);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            img[i + 0] = 0.7f;                          // flat
+            img[i + 1] = 0.01f * static_cast<float>(x); // linear in x
+            img[i + 2] = 0.02f * static_cast<float>(y); // linear in y
+            img[i + 3] = 1.0f;
+        }
+    float out[4];
+    float maxFlat = 0.0f, maxLinX = 0.0f, maxLinY = 0.0f;
+    for (int k = 0; k < 50; ++k) {
+        const float sx = 8.0f + 0.37f * static_cast<float>(k);
+        const float sy = 6.0f + 0.29f * static_cast<float>(k);
+        if (sx > W - 8 || sy > H - 8) break;
+        weaveSamplePixel(img.data(), W, H, sx, sy, out);
+        maxFlat = std::fmax(maxFlat, std::fabs(out[0] - 0.7f));
+        maxLinX = std::fmax(maxLinX, std::fabs(out[1] - 0.01f * sx));
+        maxLinY = std::fmax(maxLinY, std::fabs(out[2] - 0.02f * sy));
+    }
+    check(maxFlat < 1e-6f, "G36a flat field reproduced exactly (sum w == 1)");
+    check(maxLinX < 1e-5f && maxLinY < 1e-5f,
+          "G36b linear ramps reproduced exactly (interpolating kernel)",
+          (std::to_string(maxLinX) + "/" + std::to_string(maxLinY)).c_str());
+}
+
+static void gateWeaveStats()
+{
+    printf("G37 weave displacement: bounded, centred, drift-dominated, format-relative\n");
+    SpeakParams pr = bloomParams(0.0f, 4.0f, 0.0f);
+    pr.profile.weaveAmount = 0.1f;   // 0.1% of H
+    const int H1 = 1080;
+    const float amp = 0.1f * 0.01f * H1;
+    double sum = 0.0, sumAbs = 0.0, lag1 = 0.0, var = 0.0;
+    float prev = 0.0f, dmax = 0.0f;
+    const int N = 4096;
+    std::vector<float> ys(N);
+    for (int f = 0; f < N; ++f) {
+        pr.frameIndex = f;
+        float dx, dy;
+        weaveDisp(pr, H1, dx, dy);
+        dmax = std::fmax(dmax, std::fmax(std::fabs(dx) / amp, std::fabs(dy) / (1.4f * amp)));
+        ys[f] = dy; sum += dy; sumAbs += std::fabs(dy);
+    }
+    const double mean = sum / N;
+    for (int f = 0; f < N; ++f) var += (ys[f] - mean) * (ys[f] - mean);
+    for (int f = 1; f < N; ++f) lag1 += (ys[f] - mean) * (ys[f - 1] - mean);
+    lag1 /= (var > 0 ? var : 1);
+    check(dmax <= 1.0f + 1e-4f, "G37a |displacement| bounded by the stated amplitude",
+          (std::to_string(dmax)).c_str());
+    check(std::fabs(mean) < 0.2 * (sumAbs / N),
+          "G37b long-run mean ~ 0 (weave wanders, it does not drift away)");
+    check(lag1 > 0.5, "G37c lag-1 autocorrelation > 0.5 (drift-dominated, not white)",
+          (std::to_string(lag1)).c_str());
+    // format-relative: same %, double the height, double the pixels — exact
+    pr.frameIndex = 977;
+    float dx1, dy1, dx2, dy2;
+    weaveDisp(pr, 1080, dx1, dy1);
+    weaveDisp(pr, 2160, dx2, dy2);
+    check(std::fabs(dx2 - 2.0f * dx1) < 1e-4f && std::fabs(dy2 - 2.0f * dy1) < 1e-4f,
+          "G37d displacement scales with frame height exactly");
+}
+
+static void gateWeaveScopesPinned()
+{
+    printf("G38 scopes are pinned under weave (chrome does not weave)\n");
+    const int W = 640, H = 480;   // scope layout size used elsewhere in suite
+    std::vector<float> src, a, b;
+    bloomScene(src, W, H, 20.0f, 0.05f, 2.0f, 2.0f, 2.0f);
+    a.resize(src.size()); b.resize(src.size());
+    SpeakParams pr = bloomParams(0.0f, 4.0f, 0.0f);
+    pr.enableTone = 1; pr.inputColorSpace = SPEAK_CS_DWG_INTERMEDIATE;
+    pr.scopeHD = 1; pr.scopeDensity = 1;
+    pr.profile.weaveAmount = 0.4f; pr.frameIndex = 55;
+    speakFrame(src.data(), W, H, pr, a.data());
+    pr.profile.weaveAmount = 0.0f;
+    speakFrame(src.data(), W, H, pr, b.data());
+    // every pixel the SCOPES own must be identical weave-on vs weave-off
+    std::vector<uint32_t> zstats(SPEAK_STATS_UINTS, 0u);   // scope fns read stats
+    int scopeDiff = 0, scopePix = 0;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            float sr, sg, sb;
+            const bool inScope =
+                hdScopePixel(x, y, W, H, pr, zstats.data(), sr, sg, sb) ||
+                densityScopePixel(x, y, W, H, pr, zstats.data(), sr, sg, sb);
+            if (!inScope) continue;
+            scopePix++;
+            const size_t i = (static_cast<size_t>(y) * W + x) * 4;
+            if (a[i] != b[i] || a[i + 1] != b[i + 1] || a[i + 2] != b[i + 2])
+                scopeDiff++;
+        }
+    check(scopePix > 1000, "G38a the scope region exists at this size",
+          (std::to_string(scopePix)).c_str());
+    check(scopeDiff == 0, "G38b scope pixels identical under weave",
+          (std::to_string(scopeDiff) + " differed").c_str());
+}
+
 int main()
 {
     printf("=== Speak CPU gate suite ===\n");
@@ -1003,6 +1557,20 @@ int main()
     gateGrainMean();
     gateGrainMatte();
     gateGrainStructure();
+    gateBloomIdentity();
+    gateBloomEnergy();
+    gateBloomBorrow();
+    gateBloomNeutral();
+    gateBloomVeil();
+    gateBloomResolution();
+    gateBloomScopeSeesBloom();
+    gateVignette();
+    gateVignetteSite();
+    gateVignetteHalation();
+    gateWeaveIdentity();
+    gateWeaveCR();
+    gateWeaveStats();
+    gateWeaveScopesPinned();
     printf("\n%s (%d failures)\n", g_fail ? "FAILED" : "ALL GATES GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

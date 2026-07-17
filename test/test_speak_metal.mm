@@ -299,6 +299,58 @@ int main()
       p.scopeDensity = 1;
       runHot(device, queue, W, H, p, "halation + grain + dye + parade", 1); }
 
+    // Bloom drives its own pyramid on the LOOK's output — the hot frame's
+    // disc + saturated blue lamp are the teeth (a GPU that skipped the bloom
+    // passes renders no halo and no source-borrow, and fails loud).
+    printf("  -- bloom (energy-conserving, veiled) --\n");
+    { SpeakParams p = halParams(0.0f, 1.0f); p.profile.bloomAmount = 0.0f;
+      runHot(device, queue, W, H, p, "bloom amount 0 (skip path)", 0); }
+    { SpeakParams p = halParams(0.0f, 1.0f); p.profile.bloomAmount = 0.6f;
+      p.profile.bloomRadius = 3.0f; p.profile.bloomVeil = 0.0f;
+      runHot(device, queue, W, H, p, "bloom s0.6 r3 no veil", 0); }
+    { SpeakParams p = halParams(0.0f, 1.0f); p.profile.bloomAmount = 0.6f;
+      p.profile.bloomRadius = 8.0f; p.profile.bloomVeil = 0.5f;
+      runHot(device, queue, W, H, p, "bloom wide + veil 0.5", 0); }
+    { SpeakParams p = halParams(0.0f, 1.0f); p.profile.bloomAmount = 0.8f;
+      p.profile.bloomVeil = 0.25f; p.viewMode = SPEAK_VIEW_BLOOM;
+      runHot(device, queue, W, H, p, "bloom isolated (signed delta) view", 0); }
+    { SpeakParams p = halParams(0.9f, 1.5f); p.profile.bloomAmount = 0.5f;
+      p.profile.bloomVeil = 0.2f; p.enableGrain = 1; p.profile.grainAmount = 0.4f;
+      p.frameIndex = 12; p.scopeDensity = 1;
+      runHot(device, queue, W, H, p, "halation + grain + bloom + parade", 1); }
+
+    printf("  -- vignette (cos^4, pre-curve) --\n");
+    { SpeakParams p = baseParams(); p.enableOptics = 1; p.profile.vignAmount = 0.0f;
+      run(device, queue, W, H, p, "vignette amount 0 (skip path)", 0); }
+    { SpeakParams p = baseParams(); p.enableOptics = 1; p.profile = stockProfile();
+      p.enableOptics = 1; p.profile.vignAmount = 0.9f; p.profile.vignField = 35.0f;
+      run(device, queue, W, H, p, "vignette 0.9 field 35 + stock", 0); }
+    { SpeakParams p = halParams(0.9f, 1.5f); p.profile.vignAmount = 1.0f;
+      p.profile.vignField = 40.0f;
+      runHot(device, queue, W, H, p, "vignette + halation (corner scatter dims)", 0); }
+
+    printf("  -- gate weave (deterministic displacement) --\n");
+    { SpeakParams p = baseParams(); p.enableOptics = 1; p.profile.weaveAmount = 0.0f;
+      run(device, queue, W, H, p, "weave amount 0 (skip path)", 0); }
+    { SpeakParams p = baseParams(); p.enableOptics = 1; p.profile = stockProfile();
+      p.enableOptics = 1; p.profile.weaveAmount = 0.4f; p.frameIndex = 137;
+      run(device, queue, W, H, p, "weave 0.4% frame 137", 0); }
+    { SpeakParams p = baseParams(); p.enableOptics = 1; p.profile = stockProfile();
+      p.enableOptics = 1; p.profile.weaveAmount = 0.4f; p.frameIndex = 138;
+      run(device, queue, W, H, p, "weave next frame (wanders)", 0); }
+    { SpeakParams p = baseParams(); p.enableOptics = 1; p.profile = stockProfile();
+      p.enableOptics = 1; p.profile.weaveAmount = 0.4f; p.frameIndex = 137;
+      p.scopeHD = 1; p.scopeDensity = 1;
+      run(device, queue, W, H, p, "weave + scopes (chrome pinned)", 1); }
+
+    // The everything case: all Phase-4 optics live at once, odd dims.
+    { SpeakParams p = halParams(0.8f, 1.5f); p.enableGrain = 1;
+      p.profile.grainAmount = 0.5f; p.profile.bloomAmount = 0.4f;
+      p.profile.bloomVeil = 0.15f; p.profile.vignAmount = 0.7f;
+      p.profile.weaveAmount = 0.3f; p.frameIndex = 41;
+      runSrc(device, queue, 353, 225, p, "everything at once, 353x225", 0,
+             makeHotFrame(353, 225)); }
+
     printf("\n%s (%d failures)\n", g_fail ? "PARITY FAILED" : "PARITY GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

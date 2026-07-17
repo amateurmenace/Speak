@@ -45,6 +45,7 @@ __device__ float log2f(float);
 __device__ float powf(float, float);
 __device__ float log10f(float);
 __device__ float floorf(float);
+__device__ float tanf(float);       // Speak: vignette's cos^4 via tan (nvcc device fn)
 __device__ unsigned max(unsigned, unsigned);
 __device__ int max(int, int);
 __device__ int min(int, int);

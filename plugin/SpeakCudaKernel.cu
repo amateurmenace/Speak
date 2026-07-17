@@ -7,6 +7,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdio>
 #include <map>
 
@@ -32,7 +33,7 @@ namespace {
 #define kDI_LIN_CUT 0.00262409f
 #define kDI_LOG_CUT 0.02740668f
 
-__device__ inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+__host__ __device__ inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 __device__ inline float lerpf(float a, float b, float t) { return a + (b - a) * t; }
 __device__ inline float pow10f(float x) { return exp2f(x * 3.32192809f); }
 
@@ -220,8 +221,10 @@ __device__ inline bool splitActive(const SpeakProfile& p)
 // are __host__ __device__; the rest stay __device__.
 // ---------------------------------------------------------------------------
 #define kHalSigmaC   0.645497f   // sqrt(0.25 + 1/6): sigma_L / 2^L
-#define kHalCoreFall 3.0f        // octaves tighter than target: fast cut
-#define kHalSkirtFall 1.0f       // octaves broader: halve per octave
+// Fall rates are ARGUMENTS, passed from the host launches (kHostHalCoreFall
+// etc.): halation and bloom share the pyramid machinery with different
+// profiles (speak_core.h). No kernel-side fall constants exist on purpose —
+// a constant here that nothing reads would be a knob that cannot fire.
 
 __device__ const float kHalWeight[3] = { 1.0f, 0.30f, 0.10f };
 __device__ const float kHalDec[4] = { 0.125f, 0.375f, 0.375f, 0.125f };
@@ -277,12 +280,12 @@ __device__ inline float halLevelSigma(int L)
     return sqrtf(0.25f * (q - 1.0f) + up);
 }
 
-__device__ inline float halLevelWeight(int L, float sigmaTarget)
+__device__ inline float halLevelWeight(int L, float sigmaTarget, float coreFall, float skirtFall)
 {
     float s = sigmaTarget < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : sigmaTarget;
     float Lt = log2f(s / kHalSigmaC);
     float d = (float)L - Lt;
-    return (d <= 0.0f) ? exp2f(kHalCoreFall * d) : exp2f(-kHalSkirtFall * d);
+    return (d <= 0.0f) ? exp2f(coreFall * d) : exp2f(-skirtFall * d);
 }
 
 // ---- pyramid taps ----
@@ -340,10 +343,10 @@ __device__ inline float halSampleLevel(const float* arena, int off, int lw, int 
 
 // The mixture's total weight — the normalizer that makes the pyramid
 // energy-preserving. Same loop, same halLevelWeight, on every backend.
-__device__ inline float halWeightSum(int nLev, float sigmaTarget)
+__device__ inline float halWeightSum(int nLev, float sigmaTarget, float coreFall, float skirtFall)
 {
     float wsum = 0.0f;
-    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget);
+    for (int L = 0; L < nLev; ++L) wsum += halLevelWeight(L, sigmaTarget, coreFall, skirtFall);
     return wsum;
 }
 
@@ -373,10 +376,11 @@ __device__ inline float halWeightSum(int nLev, float sigmaTarget)
 // construction and parity is untouched. `sigmaTarget` stays in-kernel so it
 // cannot drift from the normalize pass.
 __device__ inline void halAccumPixel(float* arena, int L, int nLev, float sigmaTarget,
+                                     float coreFall, float skirtFall,
                                      int lw, int lh, int off, int cw, int ch, int coff,
                                      int x, int y, float* out)
 {
-    float wl = halLevelWeight(L, sigmaTarget);
+    float wl = halLevelWeight(L, sigmaTarget, coreFall, skirtFall);
     if (L >= nLev - 1) {                       // the coarsest level: nothing above it
         for (int c = 0; c < 3; ++c) out[c] = wl * halFetch(arena, off, lw, lh, x, y, c);
         return;
@@ -391,13 +395,14 @@ __device__ inline void halAccumPixel(float* arena, int L, int nLev, float sigmaT
 // see the core: a scatter-blind density parade is an L3 bug parity CANNOT catch.
 __device__ inline void lookLinear(float r, float g, float b,
                                   float scatR, float scatG, float scatB,
+                                  float vgain,
                                   const SpeakParams& pr,
                                   float& oR, float& oG, float& oB)
 {
     int cs = pr.inputColorSpace;
-    float lr = decodeToLinear(cs, r);
-    float lg = decodeToLinear(cs, g);
-    float lb = decodeToLinear(cs, b);
+    float lr = vgain * decodeToLinear(cs, r);
+    float lg = vgain * decodeToLinear(cs, g);
+    float lb = vgain * decodeToLinear(cs, b);
     float mr = lr, mg = lg, mb = lb;
     if ((pr.enableTone != 0) && (pr.strength > 0.0f)) {
         float s = clampf(pr.strength, 0.0f, 1.0f);
@@ -483,6 +488,90 @@ __device__ inline void applyGrain(float& r, float& g, float& b, float conf,
         float sigmaD = a * sqrtf(Dc);
         float n = grainBand(fx, fy, sz, fr, (unsigned int)c);
         *ch = pow10f(-(D + sigmaD * n));
+    }
+}
+
+// ---- VIGNETTE (Phase 4) — cos^4, pre-curve; see speak_core.h ----
+__device__ inline bool vignActive(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) && (pr.strength > 0.0f)
+        && (pr.profile.vignAmount > 0.0f);
+}
+__device__ inline float vignGain(int x, int y, int W, int H, const SpeakParams& pr)
+{
+    if (!vignActive(pr)) return 1.0f;
+    float a = clampf(pr.profile.vignAmount, 0.0f, 1.0f)
+            * clampf(pr.strength, 0.0f, 1.0f);
+    float cx = 0.5f * (float)(W - 1);
+    float cy = 0.5f * (float)(H - 1);
+    float dx = (float)x - cx, dy = (float)y - cy;
+    float rhd2 = cx * cx + cy * cy;
+    float r2 = (dx * dx + dy * dy) / (rhd2 > 0.0f ? rhd2 : 1.0f);
+    float tanm = tanf(pr.profile.vignField * 0.017453293f);
+    float c2 = 1.0f / (1.0f + r2 * tanm * tanm);
+    return lerpf(1.0f, c2 * c2, a);
+}
+
+// ---- BLOOM (Phase 4) — energy-conserving glare; see speak_core.h.
+// Amount/active are __host__ __device__ like halAmountOf/halActive: the host
+// gates the whole chain on the same arithmetic the kernels use.
+__host__ __device__ inline float bloomAmountOf(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) ? clampf(pr.profile.bloomAmount, 0.0f, 1.0f) : 0.0f;
+}
+__host__ __device__ inline bool bloomActive(const SpeakParams& pr)
+{
+    return (pr.strength > 0.0f) && (bloomAmountOf(pr) > 0.0f);
+}
+__device__ inline float bloomSigmaPx(int H, const SpeakParams& pr)
+{
+    float s = pr.profile.bloomRadius * 0.01f * (float)H;
+    return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
+}
+__device__ inline void bloomApplyPixel(float& r, float& g, float& b,
+                                       float sR, float sG, float sB,
+                                       const SpeakParams& pr)
+{
+    if (!bloomActive(pr)) return;
+    float a = bloomAmountOf(pr) * clampf(pr.strength, 0.0f, 1.0f);
+    r = lerpf(r, sR, a);
+    g = lerpf(g, sG, a);
+    b = lerpf(b, sB, a);
+}
+
+// ---- GATE WEAVE sampling (Phase 4) — Catmull-Rom, see speak_core.h.
+// (The frame's displacement is computed HOST-side by the same speak_core
+// closed form and passed in — it is frame-uniform.)
+__device__ inline void weaveCRw(float t, float* w)
+{
+    float t2 = t * t, t3 = t2 * t;
+    w[0] = -0.5f * t3 + t2 - 0.5f * t;
+    w[1] =  1.5f * t3 - 2.5f * t2 + 1.0f;
+    w[2] = -1.5f * t3 + 2.0f * t2 + 0.5f * t;
+    w[3] =  0.5f * t3 - 0.5f * t2;
+}
+__device__ inline void weaveSamplePixel(const float* img, int W, int H,
+                                        float sx, float sy, float* out4)
+{
+    float fx = floorf(sx), fy = floorf(sy);
+    int x0 = (int)fx, y0 = (int)fy;
+    float wx[4], wy[4];
+    weaveCRw(sx - fx, wx);
+    weaveCRw(sy - fy, wy);
+    for (int c = 0; c < 4; ++c) out4[c] = 0.0f;
+    for (int j = 0; j < 4; ++j) {
+        int yy = y0 - 1 + j;
+        int yc = yy < 0 ? 0 : (yy >= H ? H - 1 : yy);
+        for (int i = 0; i < 4; ++i) {
+            int xx = x0 - 1 + i;
+            int xc = xx < 0 ? 0 : (xx >= W ? W - 1 : xx);
+            float w = wx[i] * wy[j];
+            size_t o = ((size_t)yc * W + xc) * 4;
+            out4[0] += w * img[o + 0];
+            out4[1] += w * img[o + 1];
+            out4[2] += w * img[o + 2];
+            out4[3] += w * img[o + 3];
+        }
     }
 }
 
@@ -636,8 +725,10 @@ __device__ inline void deliverInput(const SpeakParams& pr, float r, float g, flo
 
 __device__ inline void processPixel(float r, float g, float b, float srcA,
                                     float scatR, float scatG, float scatB,
+                                    float bloomR, float bloomG, float bloomB,
                                     int x, int y, int W, int H,
                                     const SpeakParams& pr, const unsigned int* stats,
+                                    int drawScopes,
                                     float& outR, float& outG, float& outB)
 {
     int cs = pr.inputColorSpace;
@@ -645,14 +736,18 @@ __device__ inline void processPixel(float r, float g, float b, float srcA,
     bool dyeOn = (pr.enableDye != 0) && dyeActive(pr.profile);
     bool splitOn = (pr.enableSplit != 0) && splitActive(pr.profile);
     bool grainOn = grainActive(pr);
+    bool bloomOn = bloomActive(pr);
+    bool vignOn = vignActive(pr);
     bool bake = (pr.outputMode == 1);
-    if (!toneOn && !dyeOn && !splitOn && !grainOn && !bake) {
+    if (!toneOn && !dyeOn && !splitOn && !grainOn && !bloomOn && !vignOn && !bake) {
         // Halation cannot reach here: halActive() requires toneOn.
         outR = r; outG = g; outB = b;
     } else {
         float mr, mg, mb;
-        lookLinear(r, g, b, scatR, scatG, scatB, pr, mr, mg, mb);
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, mr, mg, mb);
         applyGrain(mr, mg, mb, srcA, x, y, H, pr);
+        bloomApplyPixel(mr, mg, mb, bloomR, bloomG, bloomB, pr);
         if (bake) {
             float rr, rg, rb;
             gamutToRec709Lin(cs, mr, mg, mb, rr, rg, rb);
@@ -700,7 +795,8 @@ __device__ inline void processPixel(float r, float g, float b, float srcA,
     // received, through the same output transform. Never auto-gained.
     if (pr.viewMode == 4) {
         float pr0, pg0, pb0, pr1, pg1, pb1;
-        lookLinear(r, g, b, scatR, scatG, scatB, pr, pr0, pg0, pb0);
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, pr0, pg0, pb0);
         pr1 = pr0; pg1 = pg0; pb1 = pb0;
         applyGrain(pr1, pg1, pb1, srcA, x, y, H, pr);
         float gr = k18Gray + (pr1 - pr0);
@@ -725,9 +821,42 @@ __device__ inline void processPixel(float r, float g, float b, float srcA,
         }
     }
 
-    float sr, sg, sb;
-    if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
-    if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    // Isolated-bloom view: gray + the SIGNED delta (out - look); the borrow
+    // at sources is negative, the halo positive — see speak_core.h.
+    if (pr.viewMode == SPEAK_VIEW_BLOOM) {
+        float lr0, lg0, lb0, lr1, lg1, lb1;
+        lookLinear(r, g, b, scatR, scatG, scatB, vignGain(x, y, W, H, pr),
+                   pr, lr0, lg0, lb0);
+        applyGrain(lr0, lg0, lb0, srcA, x, y, H, pr);
+        lr1 = lr0; lg1 = lg0; lb1 = lb0;
+        bloomApplyPixel(lr1, lg1, lb1, bloomR, bloomG, bloomB, pr);
+        float gr = k18Gray + (lr1 - lr0);
+        float gg = k18Gray + (lg1 - lg0);
+        float gb = k18Gray + (lb1 - lb0);
+        if (bake) {
+            float rr, rg, rb;
+            gamutToRec709Lin(cs, gr, gg, gb, rr, rg, rb);
+            gr = rr < 0.0f ? 0.0f : rr;
+            gg = rg < 0.0f ? 0.0f : rg;
+            gb = rb < 0.0f ? 0.0f : rb;
+            outR = encodeFromLinear(1, gr);
+            outG = encodeFromLinear(1, gg);
+            outB = encodeFromLinear(1, gb);
+        } else {
+            gr = gr < 0.0f ? 0.0f : gr;
+            gg = gg < 0.0f ? 0.0f : gg;
+            gb = gb < 0.0f ? 0.0f : gb;
+            outR = encodeFromLinear(cs, gr);
+            outG = encodeFromLinear(cs, gg);
+            outB = encodeFromLinear(cs, gb);
+        }
+    }
+
+    if (drawScopes != 0) {
+        float sr, sg, sb;
+        if (hdScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+        if (densityScopePixel(x, y, W, H, pr, stats, sr, sg, sb)) { outR = sr; outG = sg; outB = sb; }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -754,9 +883,11 @@ __global__ void SpeakExcessKernel(SpeakParams p, int W, int H,
     float th = p.profile.halThresh;
     float4 s = src[y * W + x];
     size_t o = ((size_t)y * W + x) * 3;   // level 0's arena offset is 0
-    arena[o + 0] = halExcess(decodeToLinear(cs, s.x), th);
-    arena[o + 1] = halExcess(decodeToLinear(cs, s.y), th);
-    arena[o + 2] = halExcess(decodeToLinear(cs, s.z), th);
+    // vignette first: light the lens never delivered cannot halate
+    float vg = vignGain(x, y, W, H, p);
+    arena[o + 0] = halExcess(vg * decodeToLinear(cs, s.x), th);
+    arena[o + 1] = halExcess(vg * decodeToLinear(cs, s.y), th);
+    arena[o + 2] = halExcess(vg * decodeToLinear(cs, s.z), th);
 }
 
 // One dispatch PER LEVEL L = 1..nLev-1: [1,3,3,1]/8 decimation of level L-1 into
@@ -788,15 +919,17 @@ __global__ void SpeakDecimateKernel(int W, int H, int L, float* arena)
 // launch on the stream completes before the next begins, so no explicit
 // inter-level sync is needed.
 __global__ void SpeakAccumKernel(SpeakParams p, int H, int L, int nLev,
+                                 float coreFall, float skirtFall, int isBloom,
                                  int lw, int lh, int off, int cw, int ch, int coff,
                                  float* arena)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= lw || y >= lh) return;
-    float sig = halSigmaPx(H, p);
+    float sig = (isBloom != 0) ? bloomSigmaPx(H, p) : halSigmaPx(H, p);
     float v[3];
-    halAccumPixel(arena, L, nLev, sig, lw, lh, off, cw, ch, coff, x, y, v);
+    halAccumPixel(arena, L, nLev, sig, coreFall, skirtFall,
+                  lw, lh, off, cw, ch, coff, x, y, v);
     size_t o = ((size_t)off + (size_t)y * lw + x) * 3;
     arena[o + 0] = v[0]; arena[o + 1] = v[1]; arena[o + 2] = v[2];
 }
@@ -804,19 +937,31 @@ __global__ void SpeakAccumKernel(SpeakParams p, int H, int L, int nLev,
 // Full res: normalize level 0 of the accumulated arena into the scatter plane.
 // sum(w) = 1 => energy preserved. halWeightSum runs in-kernel against the same
 // __device__ halLevelWeight the accumulate used, so there is no host/device math
-// path that could drift from the reference.
+// path that could drift from the reference. `isBloom` selects the sigma; the
+// veil share and its weight are computed IN-KERNEL from the same halWeightSum.
+// Halation runs this with isBloom = 0 (veil 0) and the mean buffer as a
+// placeholder whose value is multiplied by that zero — it must be a valid,
+// finite allocation, never null (0 * NaN would poison the plane).
 __global__ void SpeakNormalizeKernel(SpeakParams p, int W, int H, int nLev,
-                                     const float* arena, float* scat)
+                                     float coreFall, float skirtFall, int isBloom,
+                                     const float* arena, float* scat,
+                                     const float* meanC)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= W || y >= H) return;
-    float sig = halSigmaPx(H, p);
-    float inv = 1.0f / halWeightSum(nLev, sig);
+    float sig = (isBloom != 0) ? bloomSigmaPx(H, p) : halSigmaPx(H, p);
+    float base = halWeightSum(nLev, sig, coreFall, skirtFall);
+    float veil = 0.0f;
+    if (isBloom != 0) {
+        float v = clampf(p.profile.bloomVeil, 0.0f, 0.9f);
+        if (v > 0.0f) veil = v / (1.0f - v) * base;
+    }
+    float inv = 1.0f / (base + veil);
     size_t o = ((size_t)y * W + x) * 3;   // level 0's arena offset is 0
-    scat[o + 0] = arena[o + 0] * inv;
-    scat[o + 1] = arena[o + 1] * inv;
-    scat[o + 2] = arena[o + 2] * inv;
+    scat[o + 0] = (arena[o + 0] + veil * meanC[0]) * inv;
+    scat[o + 1] = (arena[o + 1] + veil * meanC[1]) * inv;
+    scat[o + 2] = (arena[o + 2] + veil * meanC[2]) * inv;
 }
 
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
@@ -824,7 +969,8 @@ __global__ void SpeakNormalizeKernel(SpeakParams p, int W, int H, int nLev,
 // `scat` is the W*H*3 scatter field, or null when halation is off — the density
 // parade MUST see it, or it draws the halo darker than the pixels became.
 __global__ void SpeakStatsKernel(SpeakParams p, int W, int H,
-                                 const float4* src, const float* scat, unsigned int* stats)
+                                 const float4* src, const float* scat,
+                                 const float* bscat, unsigned int* stats)
 {
     int x = (blockIdx.x * blockDim.x + threadIdx.x) * 2;
     int y = (blockIdx.y * blockDim.y + threadIdx.y) * 2;
@@ -839,9 +985,13 @@ __global__ void SpeakStatsKernel(SpeakParams p, int W, int H,
         float mr, mg, mb;
         lookLinear(s.x, s.y, s.z,
                    scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
-                   scat ? scat[j + 2] : 0.0f, p, mr, mg, mb);
-        // Grain is part of the result, so the parade measures it (G17's rule).
+                   scat ? scat[j + 2] : 0.0f,
+                   vignGain(x, y, W, H, p), p, mr, mg, mb);
+        // Grain and bloom are part of the result, so the parade measures
+        // them (G17's rule; bscat is null exactly when bloom is off).
         applyGrain(mr, mg, mb, s.w, x, y, H, p);
+        if (bscat)
+            bloomApplyPixel(mr, mg, mb, bscat[j + 0], bscat[j + 1], bscat[j + 2], p);
         int col = wfColOf(x, W);
         atomicAdd(&stats[wfIdx(0, col, wfRowOf(density10(mr)))], 1u);
         atomicAdd(&stats[wfIdx(1, col, wfRowOf(density10(mg)))], 1u);
@@ -862,8 +1012,9 @@ __global__ void SpeakStatsMaxKernel(unsigned int* stats)
 }
 
 __global__ void SpeakKernel(SpeakParams p, int W, int H,
-                            const float4* src, const float* scat, float4* dst,
-                            const unsigned int* stats)
+                            const float4* src, const float* scat,
+                            const float* bscat, float4* dst,
+                            const unsigned int* stats, int drawScopes)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -875,9 +1026,80 @@ __global__ void SpeakKernel(SpeakParams p, int W, int H,
     processPixel(s.x, s.y, s.z, s.w,
                  scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
                  scat ? scat[j + 2] : 0.0f,
-                 x, y, W, H, p, stats, oR, oG, oB);
+                 bscat ? bscat[j + 0] : 0.0f, bscat ? bscat[j + 1] : 0.0f,
+                 bscat ? bscat[j + 2] : 0.0f,
+                 x, y, W, H, p, stats, drawScopes, oR, oG, oB);
     float4 o; o.x = oR; o.y = oG; o.z = oB; o.w = s.w;
     dst[i] = o;
+}
+
+// The LOOK's working-linear output (grain included) into arena level 0 — the
+// field bloom scatters. Mirrors speakFrame's lookBuf pass; the main kernel
+// RECOMPUTES the same values per pixel, so the two cannot disagree.
+__global__ void SpeakLookKernel(SpeakParams p, int W, int H,
+                                const float4* src, const float* scat, float* arena)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    float4 s = src[y * W + x];
+    size_t j = ((size_t)y * W + x) * 3;
+    float lr, lg, lb;
+    lookLinear(s.x, s.y, s.z,
+               scat ? scat[j + 0] : 0.0f, scat ? scat[j + 1] : 0.0f,
+               scat ? scat[j + 2] : 0.0f,
+               vignGain(x, y, W, H, p), p, lr, lg, lb);
+    applyGrain(lr, lg, lb, s.w, x, y, H, p);
+    arena[j + 0] = lr; arena[j + 1] = lg; arena[j + 2] = lb;
+}
+
+// The veil's source: the frame mean, computed by ONE thread over the coarsest
+// level (geometry passed in, like the other level kernels). ~96 reads;
+// atomics-free by construction.
+__global__ void SpeakBloomMeanKernel(int cw, int ch, int coff,
+                                     const float* arena, float* meanC)
+{
+    if (blockIdx.x != 0 || blockIdx.y != 0 || threadIdx.x != 0 || threadIdx.y != 0) return;
+    float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f;
+    for (int y = 0; y < ch; ++y)
+        for (int x = 0; x < cw; ++x) {
+            size_t o = ((size_t)coff + (size_t)y * cw + x) * 3;
+            m0 += arena[o + 0]; m1 += arena[o + 1]; m2 += arena[o + 2];
+        }
+    float invN = 1.0f / ((float)cw * (float)ch);
+    meanC[0] = m0 * invN; meanC[1] = m1 * invN; meanC[2] = m2 * invN;
+}
+
+// The gate displaces the finished picture as one rigid sub-pixel move (all
+// four channels: the matte rides with the pixels it describes). dx/dy are
+// computed HOST-side by the same speak_core closed form — frame-uniform.
+__global__ void SpeakWeaveKernel(int W, int H, float dx, float dy,
+                                 const float* pre, float* dst)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    float out4[4];
+    weaveSamplePixel(pre, W, H, (float)x - dx, (float)y - dy, out4);
+    size_t i = ((size_t)y * W + x) * 4;
+    dst[i + 0] = out4[0]; dst[i + 1] = out4[1]; dst[i + 2] = out4[2]; dst[i + 3] = out4[3];
+}
+
+// Scopes on top of the displaced picture — panel chrome does not weave.
+__global__ void SpeakScopeOverlayKernel(SpeakParams p, int W, int H,
+                                        const unsigned int* stats, float* dst)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= W || y >= H) return;
+    float sr, sg, sb;
+    size_t i = ((size_t)y * W + x) * 4;
+    if (hdScopePixel(x, y, W, H, p, stats, sr, sg, sb)) {
+        dst[i + 0] = sr; dst[i + 1] = sg; dst[i + 2] = sb;
+    }
+    if (densityScopePixel(x, y, W, H, p, stats, sr, sg, sb)) {
+        dst[i + 0] = sr; dst[i + 1] = sg; dst[i + 2] = sb;
+    }
 }
 
 // Host side ------------------------------------------------------------------
@@ -906,15 +1128,79 @@ public:
 struct SpeakCudaRes
 {
     unsigned int* stats = nullptr;   // fixed size — allocated once
+    float* mean = nullptr;           // bloom veil mean: 4 floats, allocated once,
+                                     // zeroed at birth (the halation normalize
+                                     // reads it under a veil of 0, and
+                                     // 0 * uninitialized-NaN would still be NaN)
     // The scatter buffers are SIZE-DEPENDENT, unlike stats: the host hands us a
     // different frame size for proxy vs full res (and for every clip), so the
-    // allocated size is stored alongside the pointer and the pair is rebuilt
+    // allocated size is stored alongside the pointer and each buffer is rebuilt
     // whenever it changes. Getting this wrong is a buffer overrun on the first
-    // proxy->full-res switch. Lazy: a render with halation off never allocates.
-    float* arena = nullptr;          // halArenaPixels(W,H) * 3 floats
-    float* scat = nullptr;           // W * H * 3 floats
-    int halW = 0, halH = 0;          // frame size arena/scat were allocated for
+    // proxy->full-res switch. Lazy: a render with the module off never allocates.
+    float* arena = nullptr;          // halArenaPixels(W,H) * 3 floats — shared by
+                                     // BOTH pyramids (bloom reuses it sequentially
+                                     // once halation's content is dead), so it is
+                                     // tracked on its own size marker
+    int arnW = 0, arnH = 0;
+    float* scat = nullptr;           // halation: W * H * 3 floats
+    int halW = 0, halH = 0;
+    float* bscat = nullptr;          // bloom: W * H * 3 floats (LOOK-referred)
+    int blmW = 0, blmH = 0;
+    float* pre = nullptr;            // weave: the pre-displacement picture, W*H*4
+    int preW = 0, preH = 0;
 };
+
+// ---- gate weave, host side: the displacement is frame-uniform, so it is
+// computed here with speak_core.h's exact closed form and passed to the
+// kernel as scalars (textually parallel copies, same set as the Metal host's).
+// The fall rates ride to the kernel launches as ARGUMENTS — the kernel-side
+// constants were deleted on purpose (a constant nothing reads cannot fire).
+static const float kHostHalCoreFall    = 3.0f;   // == kHalCoreFall in the core
+static const float kHostHalSkirtFall   = 1.0f;
+static const float kHostBloomSkirtFall = 0.5f;
+
+static bool weaveActive(const SpeakParams& pr)
+{
+    return (pr.enableOptics != 0) && (pr.strength > 0.0f)
+        && (pr.profile.weaveAmount > 0.0f)
+        && (pr.viewMode == SPEAK_VIEW_RESULT);
+}
+static float hostGrainHash(unsigned int ix, unsigned int iy, unsigned int f, unsigned int ch)
+{
+    unsigned int h = ix * 374761393u + iy * 668265263u + f * 2246822519u + ch * 3266489917u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    h ^= h >> 16;
+    return (static_cast<float>(h & 0xFFFFFFu) / 16777215.0f) * 2.0f - 1.0f;
+}
+static float hostWeaveSmooth1D(float t, unsigned int salt)
+{
+    const float tf = std::floor(t);
+    const int i0 = static_cast<int>(tf);
+    const float fr = t - tf;
+    const float sm = fr * fr * (3.0f - 2.0f * fr);
+    const float n0 = hostGrainHash(static_cast<unsigned int>(i0),     0x5EA7u, 0u, salt);
+    const float n1 = hostGrainHash(static_cast<unsigned int>(i0 + 1), 0x5EA7u, 0u, salt);
+    return n0 + (n1 - n0) * sm;
+}
+static void hostWeaveDisp(const SpeakParams& pr, int H, float& dx, float& dy)
+{
+    dx = 0.0f; dy = 0.0f;
+    if (!weaveActive(pr)) return;
+    const float amp = pr.profile.weaveAmount * 0.01f * static_cast<float>(H)
+                    * clampf(pr.strength, 0.0f, 1.0f);
+    const float speed = pr.profile.weaveSpeed > 0.0f ? pr.profile.weaveSpeed : 1.0f;
+    const float t = static_cast<float>(pr.frameIndex) * speed;
+    float sx = 0.0f, sy = 0.0f, norm = 0.0f;
+    for (int o = 0; o < 6; ++o) {                       // kWeaveOctaves
+        const float period = static_cast<float>(1 << (o + 1));
+        const float a = period;
+        sx += a * hostWeaveSmooth1D(t / period, static_cast<unsigned int>(2 * o));
+        sy += a * hostWeaveSmooth1D(t / period, static_cast<unsigned int>(2 * o + 1));
+        norm += a;
+    }
+    dx = amp * sx / norm;
+    dy = amp * 1.4f * sy / norm;
+}
 
 } // namespace
 
@@ -923,11 +1209,13 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
 {
     cudaStream_t stream = static_cast<cudaStream_t>(p_Stream);
 
-    // Mirrors speakFrame: build the scatter only when halation is live, so the
-    // identity path stays bit-exact AND free (no allocation, no dispatches).
+    // Mirrors speakFrame: build each scatter only when its module is live, so
+    // the identity path stays bit-exact AND free (no allocation, no dispatches).
     const bool hal = halActive(p_Params) || (p_Params.viewMode == SPEAK_VIEW_SCATTER);
-    const int nLev = hal ? halLevelCount(p_Width, p_Height) : 0;
-    const int arenaPix = hal ? halArenaPixels(p_Width, p_Height) : 0;
+    const bool blm = bloomActive(p_Params);
+    const bool weave = weaveActive(p_Params);
+    const int nLev = (hal || blm) ? halLevelCount(p_Width, p_Height) : 0;
+    const int arenaPix = (hal || blm) ? halArenaPixels(p_Width, p_Height) : 0;
 
     // One resource set per stream, allocated lazily (mirrors Hush's per-stream
     // resource cache, lock included).
@@ -940,16 +1228,40 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
         SpeakCudaRes& r = s_res[p_Stream];
         if (!r.stats)
             cudaMalloc(&r.stats, SPEAK_STATS_UINTS * sizeof(unsigned int));
-        // Re-allocate the scatter pair whenever the frame size changes — the
-        // size check lives here (not at first use) because a size change while
-        // halation was off must still be caught the next time it comes on.
-        if (hal && (!r.arena || !r.scat || r.halW != p_Width || r.halH != p_Height)) {
+        if (!r.mean) {
+            cudaMalloc(&r.mean, 4 * sizeof(float));
+            cudaMemsetAsync(r.mean, 0, 4 * sizeof(float), stream);
+        }
+        // Re-allocate each size-dependent buffer whenever the frame size
+        // changes — the size check lives here (not at first use) because a
+        // size change while the module was off must still be caught the next
+        // time it comes on. The arena serves BOTH pyramids (bloom reuses it
+        // sequentially once halation's content is dead), so it has its own
+        // size marker: a bloom-only render must not leave a stale halation
+        // plane hidden behind a shared one.
+        if ((hal || blm) && (!r.arena || r.arnW != p_Width || r.arnH != p_Height)) {
             if (r.arena) { cudaFree(r.arena); r.arena = nullptr; }
-            if (r.scat)  { cudaFree(r.scat);  r.scat  = nullptr; }
             cudaMalloc(&r.arena, static_cast<size_t>(arenaPix) * 3 * sizeof(float));
+            r.arnW = p_Width;
+            r.arnH = p_Height;
+        }
+        if (hal && (!r.scat || r.halW != p_Width || r.halH != p_Height)) {
+            if (r.scat) { cudaFree(r.scat); r.scat = nullptr; }
             cudaMalloc(&r.scat, static_cast<size_t>(p_Width) * p_Height * 3 * sizeof(float));
             r.halW = p_Width;
             r.halH = p_Height;
+        }
+        if (blm && (!r.bscat || r.blmW != p_Width || r.blmH != p_Height)) {
+            if (r.bscat) { cudaFree(r.bscat); r.bscat = nullptr; }
+            cudaMalloc(&r.bscat, static_cast<size_t>(p_Width) * p_Height * 3 * sizeof(float));
+            r.blmW = p_Width;
+            r.blmH = p_Height;
+        }
+        if (weave && (!r.pre || r.preW != p_Width || r.preH != p_Height)) {
+            if (r.pre) { cudaFree(r.pre); r.pre = nullptr; }
+            cudaMalloc(&r.pre, static_cast<size_t>(p_Width) * p_Height * 4 * sizeof(float));
+            r.preW = p_Width;
+            r.preH = p_Height;
         }
         res = r;
     }
@@ -991,12 +1303,55 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
             halLevelInfo(p_Width, p_Height, L,     lw, lh, off);
             halLevelInfo(p_Width, p_Height, L + 1, cw, ch, coff);
             dim3 gridL((lw + block.x - 1) / block.x, (lh + block.y - 1) / block.y, 1);
+            // Halation passes its own fall rates verbatim (isBloom 0), so its
+            // arithmetic is bit-identical to the pre-bloom build.
             SpeakAccumKernel<<<gridL, block, 0, stream>>>(p_Params, p_Height, L, nLev,
+                                                          kHostHalCoreFall, kHostHalSkirtFall, 0,
                                                           lw, lh, off, cw, ch, coff, res.arena);
         }
         SpeakNormalizeKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height, nLev,
-                                                         res.arena, res.scat);
+                                                         kHostHalCoreFall, kHostHalSkirtFall, 0,
+                                                         res.arena, res.scat, res.mean);
     }
+
+    // ---- bloom chain: look field -> pyramid on the arena -> mean -> normalize.
+    // The parade measures bloom, so this must complete BEFORE the stats pass
+    // (the same ordering rule the halation chain established); stream order is
+    // the barrier, as everywhere in this file. The arena is reused: halation's
+    // content is dead once its normalize has run.
+    if (blm) {
+        SpeakLookKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height,
+                                                    reinterpret_cast<const float4*>(p_Src),
+                                                    sc, res.arena);
+        for (int L = 1; L < nLev; ++L) {
+            int lw, lh, off;
+            halLevelInfo(p_Width, p_Height, L, lw, lh, off);
+            dim3 gridL((lw + block.x - 1) / block.x, (lh + block.y - 1) / block.y, 1);
+            SpeakDecimateKernel<<<gridL, block, 0, stream>>>(p_Width, p_Height, L, res.arena);
+        }
+        // The frame mean BEFORE the in-place accumulate overwrites the levels
+        // (ONE thread, ~96 reads, atomics-free by construction).
+        {
+            int cw, ch, coff;
+            halLevelInfo(p_Width, p_Height, nLev - 1, cw, ch, coff);
+            SpeakBloomMeanKernel<<<1, 1, 0, stream>>>(cw, ch, coff, res.arena, res.mean);
+        }
+        for (int L = nLev - 1; L >= 0; --L) {
+            int lw, lh, off, cw, ch, coff;
+            halLevelInfo(p_Width, p_Height, L,     lw, lh, off);
+            halLevelInfo(p_Width, p_Height, L + 1, cw, ch, coff);
+            dim3 gridL((lw + block.x - 1) / block.x, (lh + block.y - 1) / block.y, 1);
+            SpeakAccumKernel<<<gridL, block, 0, stream>>>(p_Params, p_Height, L, nLev,
+                                                          kHostHalCoreFall, kHostBloomSkirtFall, 1,
+                                                          lw, lh, off, cw, ch, coff, res.arena);
+        }
+        SpeakNormalizeKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height, nLev,
+                                                         kHostHalCoreFall, kHostBloomSkirtFall, 1,
+                                                         res.arena, res.bscat, res.mean);
+    }
+
+    // Null when bloom is off, exactly as speakFrame passes nullptr.
+    const float* bs = blm ? res.bscat : nullptr;
 
     cudaMemsetAsync(res.stats, 0, SPEAK_STATS_UINTS * sizeof(unsigned int), stream);
     if (p_Params.scopeHD != 0 || p_Params.scopeDensity != 0) {
@@ -1007,11 +1362,33 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
                    ((p_Height + 1) / 2 + block.y - 1) / block.y, 1);
         SpeakStatsKernel<<<gridH, block, 0, stream>>>(p_Params, p_Width, p_Height,
                                                       reinterpret_cast<const float4*>(p_Src),
-                                                      sc, res.stats);
+                                                      sc, bs, res.stats);
         SpeakStatsMaxKernel<<<1, 1, 0, stream>>>(res.stats);
     }
 
+    // When the gate-weave pass is live the main kernel suppresses the scopes;
+    // they are overlaid AFTER the displacement (panel chrome does not weave).
+    const int drawScopes = weave ? 0 : 1;
     SpeakKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height,
-                                            reinterpret_cast<const float4*>(p_Src), sc,
-                                            reinterpret_cast<float4*>(p_Dst), res.stats);
+                                            reinterpret_cast<const float4*>(p_Src), sc, bs,
+                                            reinterpret_cast<float4*>(p_Dst), res.stats,
+                                            drawScopes);
+
+    if (weave) {
+        // The gate displaces the finished picture — grain, bloom and all — as
+        // one rigid sub-pixel move: copy dst aside, resample it back through
+        // Catmull-Rom, then pin the scopes on top (mirrors speakFrame's weave
+        // pass). Stream order supplies every barrier.
+        cudaMemcpyAsync(res.pre, p_Dst,
+                        static_cast<size_t>(p_Width) * p_Height * 4 * sizeof(float),
+                        cudaMemcpyDeviceToDevice, stream);
+        float wdx, wdy;
+        hostWeaveDisp(p_Params, p_Height, wdx, wdy);
+        SpeakWeaveKernel<<<grid, block, 0, stream>>>(p_Width, p_Height, wdx, wdy,
+                                                     res.pre, p_Dst);
+        if (p_Params.scopeHD != 0 || p_Params.scopeDensity != 0) {
+            SpeakScopeOverlayKernel<<<grid, block, 0, stream>>>(p_Params, p_Width, p_Height,
+                                                                res.stats, p_Dst);
+        }
+    }
 }
