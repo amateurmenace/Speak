@@ -387,7 +387,11 @@ private:
             if (mask) srcCopy = packSrcWithMask(src.get(), mask.get(), p_Args.renderWindow);
         }
         const bool injected = useMask && !srcCopy.empty();
-        params.maskExternal = injected ? 1 : 0;
+        // consume-on-use: whenever the matte drives grain — from the key wire
+        // OR the incoming alpha — Speak is the matte's consumer, and its
+        // output alpha goes opaque. A matte that keeps riding after its
+        // consumer is what host alpha math (unpremults, mixes) feeds on.
+        params.maskExternal = m_GrainMatte->getValueAtTime(t) ? 1 : 0;
 
         const bool gpu = p_Args.isEnabledMetalRender || p_Args.isEnabledCudaRender || p_Args.isEnabledOpenCLRender;
         if (gpu) {
@@ -833,13 +837,16 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                "as faster, chunkier stock.", 0.10, 0.05, 0.60, 0.01, grpGrain);
     sDefBool(p_Desc, page, "grainMatte", "Use Incoming Matte",
              "Keys the grain on Hush's clean-confidence matte: full grain where the matte is 1, "
-             "the Floor where it is 0. Two ways to feed it, in order of preference:\n"
-             "  1. COLOR PAGE (recommended): wire Hush's node KEY output (blue) into THIS node's "
-             "KEY input (blue). The matte travels its own wire and never touches the picture.\n"
-             "  2. In-band: the incoming RGBA alpha (Hush 3.7.2's Export Clean Matte). "
-             "Used only when no key is wired.\n"
-             "With a key wired, Speak's output alpha is forced opaque so nothing downstream "
-             "unpremultiplies the picture.",
+             "the Floor where it is 0.\n\n"
+             "COLOR PAGE SETUP (the one true recipe):\n"
+             "  1. Hush node: Export Clean Matte to Alpha ON, then right-click the node -> "
+             "OFX Alpha -> Enable.\n"
+             "  2. Drag the BLUE key wire: Hush's key output -> THIS node's key input.\n"
+             "  3. Turn this on.\n"
+             "No key wired? It falls back to the incoming image alpha (Fusion-page in-band mode).\n\n"
+             "Either way, Speak CONSUMES the matte: its output alpha is forced opaque, so the "
+             "matte never rides further downstream where host alpha math could touch the "
+             "picture. Off = grain is uniform and alpha passes through untouched.",
              false, grpGrain);
     sDefDouble(p_Desc, page, "grainMatteFloor", "Matte Floor",
                "Grain amount where the matte is 0 (protected motion). The real noise is still "
