@@ -41,6 +41,7 @@ typedef struct SpeakParams
     int scopeHD; int scopeDensity; int scopeVector;
     int enableGrain; int grainMatte; float grainMatteFloor;
     SpeakProfile profile;
+    int maskExternal;
 } SpeakParams;
 
 constant float kLog10_2 = 0.301029996f;
@@ -1056,7 +1057,7 @@ kernel void SpeakKernel(constant SpeakParams& p [[buffer(0)]],
     float oR, oG, oB;
     processPixel(src[i + 0], src[i + 1], src[i + 2], src[i + 3], sR, sG, sB,
                  bR, bG, bB, x, y, W, H, p, stats, drawScopes, oR, oG, oB);
-    dst[i + 0] = oR; dst[i + 1] = oG; dst[i + 2] = oB; dst[i + 3] = src[i + 3];
+    dst[i + 0] = oR; dst[i + 1] = oG; dst[i + 2] = oB; dst[i + 3] = p.maskExternal ? 1.0f : src[i + 3];
 }
 
 // The LOOK's working-linear output (grain included) into arena level 0 — the

@@ -38,11 +38,11 @@ static void gateLayout()
     printf("G1 struct layout parity\n");
     // All-4-byte-field invariant: sizeof must equal the field count * 4.
     const size_t profFields = 79;   // see SpeakParams.h; keep in sync (+3 hal +2 grain +3 bloom +2 vign +2 weave)
-    const size_t parFields  = 16 + profFields;   // +3 grain pipeline controls
+    const size_t parFields  = 17 + profFields;   // +3 grain controls, +1 maskExternal (v0.3)
     check(sizeof(float) == 4 && sizeof(int) == 4, "float/int are 4 bytes");
     check(sizeof(SpeakProfile) == profFields * 4, "sizeof(SpeakProfile)==316",
           (std::to_string(sizeof(SpeakProfile))).c_str());
-    check(sizeof(SpeakParams) == parFields * 4, "sizeof(SpeakParams)==380",
+    check(sizeof(SpeakParams) == parFields * 4, "sizeof(SpeakParams)==384",
           (std::to_string(sizeof(SpeakParams))).c_str());
     check(offsetof(SpeakParams, profile) == 16 * 4, "profile offset==64",
           (std::to_string(offsetof(SpeakParams, profile))).c_str());

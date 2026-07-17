@@ -37,7 +37,7 @@
     "Hush quiets the noise; Speak gives the image its voice. MIT-licensed, free."
 #define kSpeakIdentifier "org.opennr.Speak"
 #define kSpeakVersionMajor 0
-#define kSpeakVersionMinor 2
+#define kSpeakVersionMinor 3
 
 #define kSupportsTiles false
 #define kSupportsMultiResolution false
@@ -68,6 +68,14 @@ public:
     explicit SpeakProcessor(OFX::ImageEffect& p_Instance) : OFX::ImageProcessor(p_Instance) {}
 
     void setSrcImg(OFX::Image* p_Img) { _srcImg = p_Img; }
+    // v0.3: when the external matte is wired, the kernels read this contiguous
+    // copy (src RGB with the mask value packed into alpha) instead of the raw
+    // source buffer — so the matte reaches the SAME src[3] path the kernels
+    // already key grain on, with no kernel change.
+    void setSrcOverride(const float* p_Buf) { _srcOverride = p_Buf; }
+    const float* srcData() const {
+        return _srcOverride ? _srcOverride : static_cast<const float*>(_srcImg->getPixelData());
+    }
     void setParams(const SpeakParams& p) { _params = p; }
 
     virtual void processImagesMetal()
@@ -75,7 +83,7 @@ public:
 #ifdef __APPLE__
         const OfxRectI& b = _srcImg->getBounds();
         RunMetalSpeak(_pMetalCmdQ, b.x2 - b.x1, b.y2 - b.y1, _params,
-                      static_cast<float*>(_srcImg->getPixelData()),
+                      srcData(),
                       static_cast<float*>(_dstImg->getPixelData()));
 #endif
     }
@@ -85,7 +93,7 @@ public:
 #ifdef HUSH_ENABLE_CUDA
         const OfxRectI& b = _srcImg->getBounds();
         RunCudaSpeak(_pCudaStream, b.x2 - b.x1, b.y2 - b.y1, _params,
-                     static_cast<float*>(_srcImg->getPixelData()),
+                     srcData(),
                      static_cast<float*>(_dstImg->getPixelData()));
 #endif
     }
@@ -94,7 +102,7 @@ public:
     {
         const OfxRectI& b = _srcImg->getBounds();
         RunOpenCLSpeak(_pOpenCLCmdQ, b.x2 - b.x1, b.y2 - b.y1, _params,
-                       static_cast<float*>(_srcImg->getPixelData()),
+                       srcData(),
                        static_cast<float*>(_dstImg->getPixelData()));
     }
 
@@ -102,6 +110,7 @@ public:
 
 private:
     OFX::Image* _srcImg = nullptr;
+    const float* _srcOverride = nullptr;
     SpeakParams _params = {};
 };
 
@@ -116,6 +125,7 @@ public:
     {
         m_DstClip = fetchClip(kOfxImageEffectOutputClipName);
         m_SrcClip = fetchClip(kOfxImageEffectSimpleSourceClipName);
+        m_MaskClip = fetchClip("Matte");   // v0.3: the blue KEY input, optional
 
         m_InputCS       = fetchChoiceParam("inputColorSpace");
         m_OutputMode    = fetchChoiceParam("outputMode");
@@ -359,39 +369,94 @@ private:
             (src->getPixelComponents() != dst->getPixelComponents()))
             OFX::throwSuiteStatusException(kOfxStatErrValue);
 
-        const SpeakParams params = gatherParams(t);
+        SpeakParams params = gatherParams(t);
+
+        // v0.3: the blue-wire matte. When Use Incoming Matte is on and the node's
+        // KEY input is connected, pack the mask value into a contiguous src copy's
+        // ALPHA — the exact channel the kernels already key grain on — so no
+        // grain-code change is needed. maskExternal then forces the OUTPUT alpha
+        // opaque inside the kernels, so the matte never rides Speak's own output
+        // and Resolve can't unpremultiply (blow out) Speak's node the way a
+        // fractional pass-through alpha would.
+        std::unique_ptr<OFX::Image> mask;
+        std::vector<float> srcCopy;
+        const bool useMask = m_GrainMatte->getValueAtTime(t) && m_MaskClip &&
+                             m_MaskClip->isConnected();
+        if (useMask) {
+            mask.reset(m_MaskClip->fetchImage(t));
+            if (mask) srcCopy = packSrcWithMask(src.get(), mask.get(), p_Args.renderWindow);
+        }
+        const bool injected = useMask && !srcCopy.empty();
+        params.maskExternal = injected ? 1 : 0;
 
         const bool gpu = p_Args.isEnabledMetalRender || p_Args.isEnabledCudaRender || p_Args.isEnabledOpenCLRender;
         if (gpu) {
             SpeakProcessor proc(*this);
             proc.setDstImg(dst.get());
             proc.setSrcImg(src.get());
+            if (injected) proc.setSrcOverride(srcCopy.data());
             proc.setGPURenderArgs(p_Args);
             proc.setRenderWindow(p_Args.renderWindow);
             proc.setParams(params);
             proc.process();
         } else {
-            renderCPU(src.get(), dst.get(), params);
+            renderCPU(src.get(), dst.get(), params, injected ? srcCopy.data() : nullptr);
         }
     }
+
+    // Pack src RGB + the mask's matte (max of luma and alpha, robust to whether
+    // Resolve delivers the key in RGB or in alpha) into a contiguous RGBA buffer
+    // laid out exactly like renderCPU's, indexed from the render window origin.
+    std::vector<float> packSrcWithMask(OFX::Image* src, OFX::Image* mask,
+                                       const OfxRectI& win)
+    {
+        const int W = win.x2 - win.x1, H = win.y2 - win.y1;
+        std::vector<float> buf(static_cast<size_t>(W) * H * 4, 0.0f);
+        const bool maskRGBA = mask->getPixelComponents() == OFX::ePixelComponentRGBA;
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                const float* s = static_cast<float*>(src->getPixelAddress(win.x1 + x, win.y1 + y));
+                float* d = &buf[(static_cast<size_t>(y) * W + x) * 4];
+                if (s) { d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; }
+                float m = 0.0f;
+                const float* mp = static_cast<float*>(mask->getPixelAddress(win.x1 + x, win.y1 + y));
+                if (mp) {
+                    if (maskRGBA) {
+                        const float luma = 0.2126f * mp[0] + 0.7152f * mp[1] + 0.0722f * mp[2];
+                        m = std::max(luma, mp[3]);
+                    } else {
+                        m = mp[0];
+                    }
+                }
+                d[3] = m < 0.0f ? 0.0f : (m > 1.0f ? 1.0f : m);
+            }
+        return buf;
+    }
+
 
     // CPU reference path — packs to a contiguous frame (fetchImage buffers may
     // have padded rowBytes) and runs the SAME whole-frame entry point the tests
     // and the GPU ports are verified against, so the scope's measurement pass
     // is never duplicated. The GPU paths take Resolve's contiguous buffers.
-    void renderCPU(OFX::Image* src, OFX::Image* dst, const SpeakParams& params)
+    void renderCPU(OFX::Image* src, OFX::Image* dst, const SpeakParams& params,
+                   const float* srcOverride = nullptr)
     {
         const OfxRectI b = src->getBounds();
         const int W = b.x2 - b.x1, H = b.y2 - b.y1;
         if (W <= 0 || H <= 0) return;
         std::vector<float> in(static_cast<size_t>(W) * H * 4, 0.0f), out(static_cast<size_t>(W) * H * 4, 0.0f);
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                const float* s = static_cast<float*>(src->getPixelAddress(b.x1 + x, b.y1 + y));
-                if (!s) continue;
-                float* d = &in[(static_cast<size_t>(y) * W + x) * 4];
-                d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
-            }
+        if (srcOverride) {
+            // the packed src (RGB + mask matte in alpha) is already contiguous
+            std::memcpy(in.data(), srcOverride, in.size() * sizeof(float));
+        } else {
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const float* s = static_cast<float*>(src->getPixelAddress(b.x1 + x, b.y1 + y));
+                    if (!s) continue;
+                    float* d = &in[(static_cast<size_t>(y) * W + x) * 4];
+                    d[0] = s[0]; d[1] = s[1]; d[2] = s[2]; d[3] = s[3];
+                }
+        }
         speakcore::speakFrame(in.data(), W, H, params, out.data());
         for (int y = 0; y < H; ++y)
             for (int x = 0; x < W; ++x) {
@@ -404,6 +469,7 @@ private:
 
     OFX::Clip* m_DstClip;
     OFX::Clip* m_SrcClip;
+    OFX::Clip* m_MaskClip = nullptr;
     OFX::ChoiceParam*  m_InputCS;
     OFX::ChoiceParam*  m_OutputMode;
     OFX::BooleanParam* m_EnableTone;
@@ -528,6 +594,18 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
     OFX::ClipDescriptor* dstClip = p_Desc.defineClip(kOfxImageEffectOutputClipName);
     dstClip->addSupportedComponent(OFX::ePixelComponentRGBA);
     dstClip->setSupportsTiles(kSupportsTiles);
+
+    // v0.3: the color-page-native handoff. A mask clip — Resolve feeds the
+    // node's blue KEY input here — carries Hush's clean-confidence matte
+    // WITHOUT it ever riding the RGB path's alpha, so nothing unpremultiplies
+    // the picture. Optional: unconnected, Speak falls back to the incoming
+    // alpha (the in-band path). Named "Matte" so the UI label reads right.
+    OFX::ClipDescriptor* maskClip = p_Desc.defineClip("Matte");
+    maskClip->addSupportedComponent(OFX::ePixelComponentRGBA);
+    maskClip->addSupportedComponent(OFX::ePixelComponentAlpha);
+    maskClip->setSupportsTiles(kSupportsTiles);
+    maskClip->setIsMask(true);
+    maskClip->setOptional(true);
 
     OFX::PageParamDescriptor* page = p_Desc.definePageParam("Controls");
 
@@ -753,11 +831,15 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                "Grain pitch as a percentage of frame HEIGHT, so the physical size holds from "
                "proxy to full res. 0.10 is a fine 35mm-scan feel (~2px at UHD); bigger reads "
                "as faster, chunkier stock.", 0.10, 0.05, 0.60, 0.01, grpGrain);
-    sDefBool(p_Desc, page, "grainMatte", "Use Incoming Matte (Alpha)",
-             "Keys the grain on the INCOMING ALPHA: full grain where alpha is 1, the Floor "
-             "where it is 0. Pair with Hush 3.7's \"Export Clean Matte to Alpha\" to lay grain "
-             "exactly where the denoiser cleaned deepest and less where real noise survives. "
-             "Off = alpha is ignored. Alpha always passes through untouched.",
+    sDefBool(p_Desc, page, "grainMatte", "Use Incoming Matte",
+             "Keys the grain on Hush's clean-confidence matte: full grain where the matte is 1, "
+             "the Floor where it is 0. Two ways to feed it, in order of preference:\n"
+             "  1. COLOR PAGE (recommended): wire Hush's node KEY output (blue) into THIS node's "
+             "KEY input (blue). The matte travels its own wire and never touches the picture.\n"
+             "  2. In-band: the incoming RGBA alpha (Hush 3.7.2's Export Clean Matte). "
+             "Used only when no key is wired.\n"
+             "With a key wired, Speak's output alpha is forced opaque so nothing downstream "
+             "unpremultiplies the picture.",
              false, grpGrain);
     sDefDouble(p_Desc, page, "grainMatteFloor", "Matte Floor",
                "Grain amount where the matte is 0 (protected motion). The real noise is still "

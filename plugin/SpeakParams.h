@@ -180,6 +180,7 @@ typedef struct SpeakParams
                            // real noise is still there, so add less on top
 
     SpeakProfile profile;
+    int   maskExternal;    // v0.3: 1 = external key (blue) wired; output alpha forced opaque
 } SpeakParams;
 
 // ---------------------------------------------------------------------------

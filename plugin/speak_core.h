@@ -1722,7 +1722,7 @@ inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, fl
             dst[i + 0] = oR;
             dst[i + 1] = oG;
             dst[i + 2] = oB;
-            dst[i + 3] = src[i + 3];   // alpha passes through (the matte survives Speak)
+            dst[i + 3] = pr.maskExternal ? 1.0f : src[i + 3];   // opaque when an external key drives the matte; else passthrough
         }
     }
     if (weave) {

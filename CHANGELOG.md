@@ -1,5 +1,20 @@
 # Speak changelog
 
+## 0.3.0 — 2026-07-17
+
+- **The color-page-native Hush handoff: a real KEY input.** Speak now defines a
+  "Matte" mask clip, which Resolve feeds from the node's **blue KEY input**.
+  Wire Hush's node key output (blue) → Speak's key input (blue) and the
+  clean-confidence matte travels its **own wire** — it never rides the RGB
+  path's alpha, so nothing unpremultiplies (blows out) the picture on the
+  color page. *Use Incoming Matte* keys grain on the key when wired, and falls
+  back to the incoming RGBA alpha (Hush 3.7.2's in-band export) when it isn't.
+- With a key wired, Speak forces its **output alpha opaque**, so the matte is
+  consumed at Speak and can't blow up Speak's own node downstream.
+- The mask value is read robustly as max(luma, alpha) — correct whether Resolve
+  delivers the key in RGB or in alpha. Verified: output alpha opaque and grain
+  ~290× stronger where the key is 1 vs 0; Metal/OpenCL parity re-pinned and green.
+
 ## 0.2.0 — 2026-07-16 (early beta; first public release)
 
 First release, in Speak's own repository (the code began as a second plugin in
