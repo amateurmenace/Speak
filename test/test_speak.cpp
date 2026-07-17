@@ -120,6 +120,25 @@ static void gateIdentity()
     maxAbs = 0.0f;
     for (int i = 0; i < W * H * 4; ++i) maxAbs = std::fmax(maxAbs, std::fabs(dst[i] - src[i]));
     check(maxAbs == 0.0f, "enableTone 0 => bit-exact pass-through");
+
+    // v1.0 invariant: the NEW surfaces cannot break identity. Ship defaults
+    // have the status strip ON and a stock family selected — but with no stage
+    // active (and no composed text) the frame must still be bit-exact. This is
+    // the audit's identity concern, made a gate that can fail: if the strip
+    // ever drew at idle, or a stock preset leaked into the identity branch,
+    // maxAbs != 0 here.
+    SpeakParams pv = {};
+    pv.inputColorSpace = SPEAK_CS_DWG_INTERMEDIATE;
+    pv.enableTone = 1; pv.strength = 0.0f;
+    pv.enableGrain = 1; pv.profile.grainAmount = 0.0f;   // grain enabled, amount 0
+    pv.statusStrip = 1;                                   // strip ON (ship default)
+    pv.matteSource = SPEAK_MATTE_OFF;
+    pv.profile = stockProfile(SPEAK_STOCK_PUNCH);         // a non-neutral family selected
+    speakFrame(src.data(), W, H, pv, dst.data());
+    maxAbs = 0.0f;
+    for (int i = 0; i < W * H * 4; ++i) maxAbs = std::fmax(maxAbs, std::fabs(dst[i] - src[i]));
+    check(maxAbs == 0.0f, "v1 defaults (strip on, stock selected, all stages off) => identity",
+          (std::string("maxAbs=") + std::to_string(maxAbs)).c_str());
 }
 
 // ----------------------------------------------------------- G4 neutral

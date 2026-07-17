@@ -143,6 +143,35 @@ int main()
               std::to_string(splitHue) + " deg < " + std::to_string(lggHue) + " deg");
     }
 
+    // ---- N3: the pivot-relocation path (the one splitPivot=0 tests CANNOT reach).
+    // The hint promises "whatever sits at the pivot is never tinted" for ANY
+    // pivot; N1 only proved it at pivot=0, where gray coincides with the pivot
+    // and the shift term (pivotD = grayD - splitPivot*kLog10_2) is identically
+    // zero. Move the pivot +1.5 stops and check BOTH halves of the claim:
+    //  (a) the tone that now sits AT the shifted pivot is still exactly neutral;
+    //  (b) 18% gray, no longer at the pivot, IS now tinted — which is what makes
+    //      (a) a real test and not a tautology (a dead shift term fails HERE).
+    {
+        SpeakProfile pp = p;
+        pp.splitPivot = 1.5f;
+        const float grayD = 0.744727f, kL10 = 0.301029996f;
+        const float pivotD = grayD - pp.splitPivot * kL10;
+        const float atPivot = std::pow(10.0f, -pivotD);   // gray whose density == pivotD
+        float pr, pg, pb;
+        splitTone(atPivot, atPivot, atPivot, pp, pr, pg, pb);
+        const float pivChroma = std::fmax(std::fabs(pr - pg), std::fabs(pg - pb));
+        check(pivChroma < 1e-6f, "N3a the tone at a SHIFTED pivot stays exactly neutral",
+              "spread " + std::to_string(pivChroma) + " at pivot +1.5 stops");
+        const float pivShift = std::fabs(pr - atPivot);
+        check(pivShift < 1e-6f, "N3b the shifted-pivot tone is exactly unchanged (both weights 0)",
+              "got " + std::to_string(pr) + " want " + std::to_string(atPivot));
+        float gr, gg, gb;
+        splitTone(k18Gray, k18Gray, k18Gray, pp, gr, gg, gb);
+        const float grayChroma = std::fmax(std::fabs(gr - gg), std::fabs(gg - gb));
+        check(grayChroma > 1e-3f, "N3c 18% gray IS tinted once the pivot moves off it (shift term lives)",
+              "spread " + std::to_string(grayChroma));
+    }
+
     printf("\n%s (%d failures)\n", g_fail ? "CONTROL ARM FAILED" : "CONTROL ARM PASSED", g_fail);
     return g_fail ? 1 : 0;
 }
