@@ -1730,6 +1730,43 @@ static void gateWeaveIdentity()
           "G35e Input view is pinned (weave is RESULT-only)");
 }
 
+// The render-vs-playback contract (SPEC-1.0 §3): the whole frame is a PURE
+// function of frameIndex, so a shot rendered in sequence and the same shot
+// scrubbed to any frame land bit-identical. Renders frames in a scrambled
+// order and checks each against its canonical in-order render — a gate that
+// fails the instant any hidden per-instance/temporal state leaks in.
+static void gateWeaveRenderPlayback()
+{
+    printf("G48 weave: render == playback (frame is a pure function of index)\n");
+    const int W = 160, H = 96;
+    std::vector<float> src;
+    bloomScene(src, W, H, 7.0f, 0.05f, 2.0f, 1.0f, 0.5f);
+    SpeakParams pr = bloomParams(0.0f, 4.0f, 0.0f);
+    pr.profile.weaveAmount = 0.35f; pr.profile.weaveSpeed = 1.3f;
+    pr.enableGrain = 1; pr.profile.grainAmount = 0.5f;   // grain is per-frame too
+    const int N = 12;
+    std::vector<std::vector<float>> canon(N, std::vector<float>(src.size()));
+    for (int f = 0; f < N; ++f) {                        // "render": in order
+        pr.frameIndex = f;
+        speakFrame(src.data(), W, H, pr, canon[f].data());
+    }
+    const int order[N] = { 7, 0, 11, 3, 9, 1, 5, 8, 2, 10, 4, 6 };  // "playback": scrubbed
+    bool allMatch = true, allMoved = true;
+    std::vector<float> tmp(src.size());
+    for (int k = 0; k < N; ++k) {
+        const int f = order[k];
+        pr.frameIndex = f;
+        speakFrame(src.data(), W, H, pr, tmp.data());
+        if (std::memcmp(tmp.data(), canon[f].data(), tmp.size() * sizeof(float)) != 0)
+            allMatch = false;
+    }
+    for (int f = 1; f < N; ++f)                           // distinct frames actually differ
+        if (std::memcmp(canon[f].data(), canon[f - 1].data(), src.size() * sizeof(float)) == 0)
+            allMoved = false;
+    check(allMatch, "G48a scrubbed order == sequential order, every frame bit-identical");
+    check(allMoved, "G48b consecutive frames DO differ (so the check above can fail)");
+}
+
 static void gateWeaveCR()
 {
     printf("G36 Catmull-Rom: partition of unity, exact on linear ramps\n");
@@ -2035,6 +2072,7 @@ int main()
     gateVignetteSite();
     gateVignetteHalation();
     gateWeaveIdentity();
+    gateWeaveRenderPlayback();
     gateWeaveCR();
     gateWeaveStats();
     gateWeaveScopesPinned();
