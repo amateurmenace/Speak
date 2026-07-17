@@ -130,6 +130,8 @@ public:
 
         m_InputCS       = fetchChoiceParam("inputColorSpace");
         m_OutputMode    = fetchChoiceParam("outputMode");
+        m_StockPreset   = fetchChoiceParam("stockPreset");
+        m_FormatPreset  = fetchChoiceParam("formatPreset");
         m_EnableTone    = fetchBooleanParam("enableTone");
         m_Strength      = fetchDoubleParam("strength");
         m_Contrast      = fetchDoubleParam("contrast");
@@ -235,6 +237,30 @@ public:
         // legacy auto-resolution can never fight an explicit setting.
         if (p_ParamName == "matteSource" && m_GrainMatte->getValue())
             m_GrainMatte->setValue(false);
+        // Stock preset: swap the tone spine's BASE and write the macro
+        // handles to the preset's own values — the user SEES what the preset
+        // did and trims from there. Contrast is a trim on the preset's print
+        // gamma, so it resets to 1.
+        if (p_ParamName == "stockPreset") {
+            int ps = 0; m_StockPreset->getValue(ps);
+            float ct, sh, toe;
+            speakcore::stockHandleDefaults(ps, ct, sh, toe);
+            m_Contrast->setValue(ct);
+            m_PrintShoulder->setValue(sh);
+            m_Toe->setValue(toe);
+        }
+        // Format preset: one physical size, three frames — writes Grain Size
+        // and Halation Radius together (SPEC-1.0 §3). An applier, not a
+        // state: it sets the sliders and leaves them yours.
+        if (p_ParamName == "formatPreset") {
+            int fp = 0; m_FormatPreset->getValue(fp);
+            if (fp != SPEAK_FMT_LEAVE) {
+                float gs = 0.0f, hr = 0.0f;
+                speakcore::formatDefaults(fp, gs, hr);
+                m_GrainSize->setValue(gs);
+                m_HalRadius->setValue(hr);
+            }
+        }
         if (p_ParamName == "enableTone" || p_ParamName == "enableDye" ||
             p_ParamName == "enableSplit" || p_ParamName == "enableOptics" ||
             p_ParamName == "enableGrain" || p_ParamName == "matteSource") updateEnabledness();
@@ -331,10 +357,13 @@ private:
         p.scopeDensity    = m_ScopeDensity->getValueAtTime(t) ? 1 : 0;
         p.scopeVector     = 0;
 
-        // Build the look profile: start from the gray-balanced Neutral stock and
-        // apply the Phase-1 macro handles. Built-in stock families and Shoot-a-
-        // Chart calibration will emit this SAME struct (one kernel path).
-        SpeakProfile prof = speakcore::neutralProfile();
+        // Build the look profile: start from the selected stock family's base
+        // and apply the Phase-1 macro handles on top. Every preset emits this
+        // SAME struct and hits exactly ONE kernel path (the design promise);
+        // user calibration will too.
+        int stockPs = 0;
+        m_StockPreset->getValueAtTime(t, stockPs);
+        SpeakProfile prof = speakcore::stockProfile(stockPs);
         const float contrast = static_cast<float>(m_Contrast->getValueAtTime(t));
         const float shoulder = static_cast<float>(m_PrintShoulder->getValueAtTime(t));
         const float toe      = static_cast<float>(m_Toe->getValueAtTime(t));
@@ -605,6 +634,8 @@ private:
     OFX::Clip* m_MaskClip = nullptr;
     OFX::ChoiceParam*  m_InputCS;
     OFX::ChoiceParam*  m_OutputMode;
+    OFX::ChoiceParam*  m_StockPreset;
+    OFX::ChoiceParam*  m_FormatPreset;
     OFX::BooleanParam* m_EnableTone;
     OFX::DoubleParam*  m_Strength;
     OFX::DoubleParam*  m_Contrast;
@@ -790,6 +821,30 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
 
     sDefBool(p_Desc, page, "enableTone", "Enable Film Tone",
              "Toggle the tone scale to compare against the untouched image.", true, grpTone);
+    {
+        OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("stockPreset");
+        c->setLabels("Stock Family", "Stock Family", "Stock");
+        c->setHint("A tone-spine starting point. These are FAMILY SHAPES from published "
+                   "sensitometry (data-sheet curve families), gray-balanced, stated as "
+                   "modelled — no commercial stock is cloned or named. Selecting one also "
+                   "moves Contrast / Shoulder / Toe to the family's own values so you can "
+                   "see what it did and trim from there. The H&D scope shows the exact "
+                   "curves in use, always.\n\n"
+                   "Neutral — the gray-balanced reference spine (system gamma ~1.36).\n"
+                   "Long latitude — modern camera negative through a standard print: soft "
+                   "knee, generous highlight run, system gamma ~1.15 (the softest).\n"
+                   "Punchy print — classic negative through a hard release print: fast "
+                   "mid climb, firm toe, system gamma ~1.7.\n"
+                   "Chrome — reversal-like: steep, deep blacks, abrupt shoulder, system "
+                   "gamma ~1.8 (the steepest). Unforgiving on purpose.");
+        c->appendOption("Neutral (reference)");
+        c->appendOption("Long latitude (modern negative)");
+        c->appendOption("Punchy print (classic)");
+        c->appendOption("Chrome (reversal-like)");
+        c->setDefault(SPEAK_STOCK_NEUTRAL);
+        c->setParent(*grpTone);
+        page->addChild(*c);
+    }
     sDefDouble(p_Desc, page, "strength", "Strength",
                "Blends the film tone scale in. 0 = identity (untouched); 1 = full film "
                "response. Raise from 0 to dial the look.", 0.0, 0.0, 1.0, 0.01, grpTone);
@@ -890,6 +945,25 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
     sDefBool(p_Desc, page, "enableOptics", "Enable Light",
              "Toggle the whole optical group (vignette, halation, bloom, gate weave) to "
              "compare against the same grade without it.", false, grpLight);
+    {
+        OFX::ChoiceParamDescriptor* c = p_Desc.defineChoiceParam("formatPreset");
+        c->setLabels("Format", "Format", "Format");
+        c->setHint("Sets Halation Radius and Grain Size TOGETHER from one physical model: "
+                   "grain and halation are physical sizes on the film, so smaller formats "
+                   "carry them LARGER relative to the frame — shooting Super 16 does not "
+                   "shrink the grain, it shrinks the frame around it. Modelled from a "
+                   "~10 um grain cluster and the ~0.23 mm base-reflection ring against "
+                   "each format's aperture height (18.66 / 9.35 / 7.49 mm); the ratios "
+                   "are geometry, not measurements of any stock. An applier: it moves "
+                   "the two sliders and leaves them yours.");
+        c->appendOption("\xE2\x80\x94 (leave as set)");
+        c->appendOption("Super 35 (4-perf)");
+        c->appendOption("35mm 2-perf");
+        c->appendOption("Super 16");
+        c->setDefault(SPEAK_FMT_LEAVE);
+        c->setParent(*grpLight);
+        page->addChild(*c);
+    }
     sDefDouble(p_Desc, page, "halAmount", "Halation",
                "How much scattered light re-exposes the negative. 0 is off and is bit-exact "
                "identity — the whole scatter pass is skipped. Raise for the red bloom around "
@@ -955,7 +1029,10 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
     grpGrain->setHint("Film grain as DENSITY noise: the dye clouds are the image, so grain "
                       "multiplies light instead of adding video noise on top - shadows are loud, "
                       "paper white is grainless, and no value can go negative. Independent every "
-                      "frame (real grain boils). Set View to Grain to see exactly what is added.");
+                      "frame (real grain boils). Set View to Grain to see exactly what is added.\n\n"
+                      "The grain is DISPLAY-REFERRED: it lands on the finished look's print "
+                      "density, after the tone scale — where the projector puts it. It is not "
+                      "scene noise and does not pretend to be.");
 
     sDefBool(p_Desc, page, "enableGrain", "Enable Grain",
              "Toggle the grain stage to compare.", false, grpGrain);

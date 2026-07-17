@@ -51,7 +51,8 @@ Audit each phase against speak_core.h and finish to covenant standard
   grain is display-referred unless grainRef says otherwise.
 - **Gate weave**: needs a deterministic per-frame seed contract (frameIndex
   already plumbed) — verify render vs playback consistency in Resolve.
-- **Parity**: Metal/OpenCL/CUDA gates green; SpeakParams is 384B — the
+- **Parity**: Metal/OpenCL/CUDA gates green; SpeakParams was 384B at
+  drafting (504B once §1/§2 landed: matteKeyMissing + the status text) — the
   shader-side structs re-declare it (Metal/OpenCL sources) and test_speak.cpp
   pins sizeof + parFields; every field addition re-pins BOTH.
 - **Perf**: one full-res timing pass on 4K; scopes off = no measurable cost.

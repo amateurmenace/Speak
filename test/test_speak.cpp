@@ -1046,6 +1046,127 @@ static void gateStatusStrip()
           (std::string("in=") + std::to_string(wIn) + " out=" + std::to_string(wOut)).c_str());
 }
 
+// ------------------------------------------------------- G46 stock presets
+static void gateStockPresets()
+{
+    printf("G46 stock families: neutral, monotone, on-curve gray, honest gamma\n");
+    // The stated system-gamma anchors, in order neutral < ... The gate MEASURES
+    // the hint's claim (an honesty gate); the profiles were tuned to these.
+    const float targets[4] = { 1.36f, 1.15f, 1.69f, 1.79f };
+    for (int ps = 0; ps < 4; ++ps) {
+        SpeakParams pr = {};
+        pr.inputColorSpace = SPEAK_CS_LINEAR;
+        pr.enableTone = 1; pr.strength = 1.0f;
+        pr.profile = stockProfile(ps);
+        char nm[64];
+        // (a) gray-balanced by construction: equal channels in => equal out.
+        float r = 0.0f, g = 0.0f, b = 0.0f;
+        bool neutral = true;
+        for (int i = -5; i <= 5; ++i) {
+            const float lin = 0.18f * std::exp2(static_cast<float>(i));
+            r = toneChannel(lin, 0, pr.profile);
+            g = toneChannel(lin, 1, pr.profile);
+            b = toneChannel(lin, 2, pr.profile);
+            if (r != g || g != b) neutral = false;
+        }
+        snprintf(nm, sizeof(nm), "G46a preset %d neutral in => neutral out", ps);
+        check(neutral, nm);
+        // (b) monotone across +/-6 stops.
+        bool mono = true;
+        float prev = -1.0f;
+        for (int i = 0; i <= 240; ++i) {
+            const float stops = -6.0f + 12.0f * (i / 240.0f);
+            const float o = toneChannel(0.18f * std::exp2(stops), 0, pr.profile);
+            if (o < prev) mono = false;
+            prev = o;
+        }
+        snprintf(nm, sizeof(nm), "G46b preset %d monotone over 12 stops", ps);
+        check(mono, nm);
+        // (c) gray sits in the USABLE STRAIGHT REGION: its local gamma is at
+        // least 85% of the curve's peak local gamma over +/-3 stops (the
+        // honest definition of "gray is mid-curve" — a knee would drop it far
+        // below peak). Gray-out staying near 0 is checked by G6 already.
+        const float d = 0.25f;
+        auto localGamma = [&](float s) {
+            const float y1 = std::log2(toneChannel(0.18f * std::exp2(s + d), 0, pr.profile));
+            const float y0 = std::log2(toneChannel(0.18f * std::exp2(s - d), 0, pr.profile));
+            return (y1 - y0) / (2.0f * d);
+        };
+        const float g0 = localGamma(0.0f);
+        float peak = 0.0f;
+        for (float s = -3.0f; s <= 3.0f; s += 0.25f) peak = std::max(peak, localGamma(s));
+        snprintf(nm, sizeof(nm), "G46c preset %d gray sits in the straight region", ps);
+        check(g0 >= 0.85f * peak, nm,
+              (std::string("gray/peak=") + std::to_string(g0 / peak)).c_str());
+        // (d) measured system gamma at gray matches the family's STATED value
+        // (the hint's claim, measured — an honesty gate, +/-10%).
+        const float gamma = g0;
+        snprintf(nm, sizeof(nm), "G46d preset %d system gamma matches stated", ps);
+        check(std::fabs(gamma - targets[ps]) < 0.10f * targets[ps], nm,
+              (std::string("gamma=") + std::to_string(gamma) +
+               " stated=" + std::to_string(targets[ps])).c_str());
+    }
+    // (e) presets change the curve (a selector that did nothing would pass
+    // everything above): each family must differ from Neutral measurably.
+    bool differ = true;
+    for (int ps = 1; ps < 4; ++ps) {
+        const SpeakProfile a = stockProfile(0), c = stockProfile(ps);
+        float dmax = 0.0f;
+        for (int i = -5; i <= 5; ++i) {
+            const float lin = 0.18f * std::exp2(static_cast<float>(i));
+            dmax = std::max(dmax, std::fabs(std::log2(std::max(toneChannel(lin, 0, c), 1e-6f))
+                                          - std::log2(std::max(toneChannel(lin, 0, a), 1e-6f))));
+        }
+        if (dmax < 0.2f) differ = false;
+    }
+    check(differ, "G46e every family is measurably its own curve (>0.2 stop somewhere)");
+    // (f) the families are ORDERED by contrast: latitude < neutral < punch <
+    // chrome (the hint promises softest..steepest — a claim the gate pins).
+    auto sysGamma = [](int ps) {
+        const SpeakProfile p = stockProfile(ps);
+        const float d = 0.25f;
+        return (std::log2(toneChannel(0.18f * std::exp2(d), 0, p)) -
+                std::log2(toneChannel(0.18f * std::exp2(-d), 0, p))) / (2.0f * d);
+    };
+    const float gL = sysGamma(SPEAK_STOCK_LATITUDE), gN = sysGamma(SPEAK_STOCK_NEUTRAL);
+    const float gP = sysGamma(SPEAK_STOCK_PUNCH), gC = sysGamma(SPEAK_STOCK_CHROME);
+    check(gL < gN && gN < gP && gP < gC,
+          "G46f families ordered softest..steepest (latitude<neutral<punch<chrome)",
+          (std::to_string(gL) + "<" + std::to_string(gN) + "<" +
+           std::to_string(gP) + "<" + std::to_string(gC)).c_str());
+}
+
+// ------------------------------------------------------ G47 format presets
+static void gateFormatPresets()
+{
+    printf("G47 format presets: one physical size, three frames\n");
+    // size% x frameHeight must be CONSTANT across formats, both columns —
+    // that constancy IS the physics claim (a table typo breaks it).
+    float g35, h35, g2p, h2p, g16, h16;
+    formatDefaults(SPEAK_FMT_S35, g35, h35);
+    formatDefaults(SPEAK_FMT_2PERF, g2p, h2p);
+    formatDefaults(SPEAK_FMT_S16, g16, h16);
+    const float gp35 = g35 * formatHeightMm(SPEAK_FMT_S35);
+    const float gp2p = g2p * formatHeightMm(SPEAK_FMT_2PERF);
+    const float gp16 = g16 * formatHeightMm(SPEAK_FMT_S16);
+    const float hp35 = h35 * formatHeightMm(SPEAK_FMT_S35);
+    const float hp2p = h2p * formatHeightMm(SPEAK_FMT_2PERF);
+    const float hp16 = h16 * formatHeightMm(SPEAK_FMT_S16);
+    printf("    grain %%H: S35 %.3f  2perf %.3f  S16 %.3f   hal %%H: %.2f %.2f %.2f\n",
+           g35, g2p, g16, h35, h2p, h16);
+    check(std::fabs(gp2p / gp35 - 1.0f) < 1e-3f && std::fabs(gp16 / gp35 - 1.0f) < 1e-3f,
+          "G47a grain: same physical size on every format");
+    check(std::fabs(hp2p / hp35 - 1.0f) < 1e-3f && std::fabs(hp16 / hp35 - 1.0f) < 1e-3f,
+          "G47b halation: same physical ring on every format");
+    // The values stay inside the sliders' UI ranges (an applier that writes
+    // out-of-range values gets silently clamped into a lie).
+    check(g35 >= 0.05f && g16 <= 0.60f, "G47c grain sizes inside the slider range",
+          (std::to_string(g35) + ".." + std::to_string(g16)).c_str());
+    check(h35 >= 0.05f && h16 <= 8.0f, "G47d halation radii inside the slider range");
+    // S16 carries visibly coarser grain than S35 — the direction users feel.
+    check(g16 / g35 > 2.0f, "G47e S16 grain reads ~2.5x coarser than S35 (geometry)");
+}
+
 // ------------------------------------------------------ G32 setup guide view
 static void gateSetupGuide()
 {
@@ -1900,6 +2021,8 @@ int main()
     gateMatteKeyMissing();
     gateStatusStrip();
     gateSetupGuide();
+    gateStockPresets();
+    gateFormatPresets();
     gateGrainStructure();
     gateBloomIdentity();
     gateBloomEnergy();

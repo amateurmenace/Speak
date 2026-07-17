@@ -2069,6 +2069,125 @@ static inline SpeakProfile neutralProfile()
     return p;
 }
 
+// ---------------------------------------------------------------------------
+// STOCK PRESETS (v1.0, SPEC-1.0 §3) — tone-spine starting points.
+//
+// Three behavioural families shaped from PUBLISHED sensitometry (data-sheet
+// H&D curve families: modern camera negatives publish gamma ~0.5-0.6 with
+// long straight-line latitude; classic release-print curves publish gamma
+// ~2.6-3.1 with hard toes; reversal stocks publish overall gamma ~1.7-1.9
+// with deep Dmax and abrupt shoulders). No commercial profile is cloned and
+// no trademarked stock is named — these are FAMILY SHAPES, stated as such,
+// gray-balanced by construction (identical channels). The UI macro handles
+// (contrast / shoulder / toe / printer lights) are written by the plugin on
+// preset selection, so the preset is transparent: the user SEES the handles
+// move and can trim from there. Gated: G46 (neutrality, monotonicity, gray
+// operating point, measured system gamma per family).
+// ---------------------------------------------------------------------------
+#define SPEAK_STOCK_NEUTRAL   0
+#define SPEAK_STOCK_LATITUDE  1   // modern negative: long latitude, soft knee
+#define SPEAK_STOCK_PUNCH     2   // classic punchy print: hard toe, fast climb
+#define SPEAK_STOCK_CHROME    3   // reversal-like: steep, deep, unforgiving
+
+static inline SpeakProfile stockProfile(int preset)
+{
+    SpeakProfile p = neutralProfile();
+    switch (preset) {
+    default:
+        break;
+    case SPEAK_STOCK_LATITUDE:
+        // Modern camera negative + standard print: the negative carries the
+        // latitude (low gamma, gentle shoulder far out), the print carries
+        // the contrast. The SOFTEST family — measured system gamma 1.15 at
+        // gray (the whole point of latitude is a flatter, wider curve). Gray
+        // sits at the local-gamma peak (G46, gray/peak 0.99).
+        for (int c = 0; c < 3; ++c) {
+            p.negGamma[c] = 0.58f; p.negShoulder[c] = 1.6f; p.negToe[c] = 2.0f;
+            p.negDmax[c] = 3.10f;  p.negSpeed[c] = -1.8f;
+            p.prnGamma[c] = 2.65f; p.prnShoulder[c] = 1.9f; p.prnToe[c] = 3.0f;
+        }
+        p.systemGamma = 1.15f;
+        break;
+    case SPEAK_STOCK_PUNCH:
+        // Classic negative through a punchy release print: harder print toe
+        // (published classic print curves), quicker shoulder. Measured system
+        // gamma 1.69 at gray, gray at the peak (G46, gray/peak 0.99).
+        for (int c = 0; c < 3; ++c) {
+            p.negGamma[c] = 0.69f; p.negShoulder[c] = 2.6f; p.negToe[c] = 2.8f;
+            p.prnGamma[c] = 2.70f; p.prnShoulder[c] = 2.6f; p.prnToe[c] = 5.0f;
+            p.prnDmax[c] = 3.40f;
+        }
+        p.systemGamma = 1.69f;
+        break;
+    case SPEAK_STOCK_CHROME:
+        // Reversal-like: one unforgiving stage in spirit — here the mild
+        // negative leaves the print to do the work. The STEEPEST family —
+        // measured system gamma 1.79 at gray, deep Dmax, abrupt shoulder, the
+        // classic chrome shadow drop. Gray sits just below the local-gamma
+        // peak (G46, gray/peak 0.97 — chrome IS shoulder-heavy at gray).
+        for (int c = 0; c < 3; ++c) {
+            p.negGamma[c] = 0.70f; p.negShoulder[c] = 3.2f; p.negToe[c] = 3.0f;
+            p.prnGamma[c] = 2.78f; p.prnShoulder[c] = 3.4f; p.prnToe[c] = 6.0f;
+            p.prnDmax[c] = 3.60f;  p.prnSpeed[c] = -1.65f;
+        }
+        p.systemGamma = 1.79f;
+        break;
+    }
+    return p;
+}
+
+// The UI macro-handle values each preset writes (plugin-side, on selection):
+// contrast is a trim on the preset's own print gamma, so it resets to 1;
+// shoulder and toe SET the print curve absolutely, so they carry the
+// preset's values. Kept beside stockProfile so the two cannot drift.
+static inline void stockHandleDefaults(int preset, float& contrast,
+                                       float& shoulder, float& toe)
+{
+    const SpeakProfile p = stockProfile(preset);
+    contrast = 1.0f;
+    shoulder = p.prnShoulder[0];
+    toe      = p.prnToe[0];
+}
+
+// ---------------------------------------------------------------------------
+// FORMAT PRESETS (v1.0, SPEC-1.0 §3) — one physical size, three frames.
+//
+// Grain pitch and halation radius are PHYSICAL sizes on the film, so their
+// %-of-frame-height values scale inversely with the format's frame height:
+// shooting Super 16 does not shrink the grain, it shrinks the frame around
+// it. One modelled pair — a ~10 um effective grain cluster and the ~0.23 mm
+// base-reflection (TIR) halation ring already modelled in neutralProfile —
+// divided by each format's camera-aperture height:
+//     Super 35, 4-perf   18.66 mm
+//     35mm 2-perf         9.35 mm
+//     Super 16            7.49 mm
+// MODELLED defaults, stated as such (no stock was measured); the point is
+// the RATIOS, which are geometry, not opinion. Gated: G47 pins
+// size% x height == const across the table, both columns.
+// ---------------------------------------------------------------------------
+#define SPEAK_FMT_LEAVE   0   // "leave as set" — the preset applier's rest state
+#define SPEAK_FMT_S35     1
+#define SPEAK_FMT_2PERF   2
+#define SPEAK_FMT_S16     3
+
+static inline float formatHeightMm(int fmt)
+{
+    if (fmt == SPEAK_FMT_S35)   return 18.66f;
+    if (fmt == SPEAK_FMT_2PERF) return 9.35f;
+    if (fmt == SPEAK_FMT_S16)   return 7.49f;
+    return 0.0f;
+}
+static const float kFmtGrainUm  = 10.0f;   // effective grain-cluster size, um
+static const float kFmtHalMm    = 0.23f;   // TIR onset ring (see neutralProfile)
+
+static inline void formatDefaults(int fmt, float& grainSizePct, float& halRadiusPct)
+{
+    const float h = formatHeightMm(fmt);
+    if (h <= 0.0f) { grainSizePct = 0.0f; halRadiusPct = 0.0f; return; }
+    grainSizePct = kFmtGrainUm * 0.001f / h * 100.0f;   // um -> mm -> % of height
+    halRadiusPct = kFmtHalMm / h * 100.0f;
+}
+
 } // namespace speakcore
 
 #endif // OPENNR_SPEAK_CORE_H
