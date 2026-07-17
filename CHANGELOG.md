@@ -1,5 +1,66 @@
 # Speak changelog
 
+## 1.0.0 — 2026-07-17
+
+First stable release. The film-reconstruction counterpart to Hush is complete:
+tone, colour, optics and grain, every claim showable on screen, held to
+CPU/Metal/OpenCL parity (and a syntax-checked CUDA port) by a gate suite that
+grew to 160-plus checks.
+
+**The matte story, once and plainly.** In v0.3, *Use Incoming Matte* with no
+key wired quietly fell back to the picture's alpha. On the color page that
+alpha is opaque (1.0) — which read as "the whole frame is clean" — so grain
+landed at full strength everywhere and the Matte Floor was ignored. The silent
+fallback was the bug. So the matte source is now an explicit **choice**, not a
+guess:
+
+- **Matte Source → Off** — grain is uniform, alpha passes through untouched.
+- **Matte Source → Key input (blue wire)** — grain is keyed on Hush's
+  clean-confidence matte, wired straight into Speak's key input. If no key is
+  connected, the matte is treated as **absent**: grain holds at the Matte
+  Floor. Absence means absence — nothing substitutes silently.
+- **Matte Source → Incoming alpha** — the old in-band path (Fusion page), now
+  opt-in by explicit choice only.
+
+Consume-on-use stays and now covers every backend: whenever a matte source is
+active, Speak forces its own output alpha opaque, so the matte is spent at its
+consumer and never rides downstream where a host unpremultiply could lift it
+into the picture. Old projects migrate without changing a pixel — the v0.3
+toggle survives as a hidden param and resolves exactly as it used to render
+until you make an explicit choice, and the on-image status strip says which.
+
+**Guidance moved onto the image (tooltips are not enough).** A one-line
+**status strip** (on by default) reports the active stages, the matte source
+and its live state — `matte: key ✓ mean 0.31`, or `key not connected — grain at
+floor`, or `incoming alpha is opaque — is Hush's export on?`. A new **View →
+Setup Guide** draws the whole Hush→Speak recipe on the viewer itself: the node
+boxes, the blue key wire, the three setups and the one rule. Both are drawn by
+the render kernel, so the documentation ships inside the plugin and cannot
+drift from it. The strip and card share a 5×7 font whose table lives in all
+four backends; the plugin composes the text, the kernels only rasterize it.
+
+**Stock and format presets, both measured.** Three tone families beside Neutral
+— Long latitude (soft, system gamma ~1.15), Punchy print (~1.7), Chrome
+(reversal-like, ~1.8) — every one a family SHAPE from published sensitometry,
+gray-balanced, no commercial stock cloned or named. Selecting one moves the
+Contrast/Shoulder/Toe handles to its values, so the preset is transparent. A
+gate pins each family's measured system gamma against the number the hint
+states. Format presets — Super 35, 35mm 2-perf, Super 16 — set Grain Size and
+Halation Radius **together** from one physical model, because grain and
+halation are physical sizes on the film: a smaller format carries them larger
+relative to the frame.
+
+**Other v1 work.** Group 6 is now "Grain — where film lives"; grain is
+documented display-referred. The gate weave gained a render-vs-playback gate
+(scrubbed order equals sequential order, bit-for-bit). A phase-by-phase
+completion audit closed the last verification gap — split toning's pivot
+control is now exercised at a non-zero pivot, not just the degenerate one. The
+visual guide (docs/guide/, plus a PDF) tells the Hush + Speak story with real
+renders from the reference implementation.
+
+Bit-exact identity at default, alpha honoured, deterministic, real-time UHD via
+Metal — unchanged and still gated.
+
 ## 0.3.0 — 2026-07-17
 
 - **The color-page-native Hush handoff: a real KEY input.** Speak now defines a

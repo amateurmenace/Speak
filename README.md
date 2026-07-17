@@ -36,10 +36,13 @@ Windows/Linux, with a bit-verified CPU reference behind every kernel.
 - **Grain** — density noise, per RGB dye layer, rising with density (shadows
   loud, paper white grainless, values can never go negative), bandpass at a
   physical pitch, boiling independently every frame.
-- **The Hush handoff** — enable *Export Clean Matte to Alpha* in Hush ≥ 3.7 and
-  *Use Incoming Matte* in Speak's grain: grain lands exactly where the denoiser
-  cleaned deepest and backs off where real noise survives. "Clean early,
-  reconstruct late," as one chain.
+- **The Hush handoff** — enable *Export Clean Matte to Alpha* in Hush ≥ 3.7,
+  wire its blue key output into Speak's key input, and set Speak's grain
+  *Matte Source* to *Key input*: grain lands exactly where the denoiser cleaned
+  deepest and backs off where real noise survives. No key wired holds grain at
+  the Matte Floor — absence means absence, and the on-image status strip says
+  so. "Clean early, reconstruct late," as one chain. See **View → Setup Guide**,
+  or the [visual guide](docs/guide/).
 - **Scopes and honest views** — H&D curves with the frame's exposure histogram,
   a Status-M density parade measured from the true result, and isolated
   halation/grain views that are never auto-gained (a subtle effect correctly

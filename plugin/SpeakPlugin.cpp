@@ -31,10 +31,16 @@
     "Speak — the free film-reconstruction node. Drop it on the LAST node of a " \
     "DaVinci Wide Gamut / Intermediate managed timeline; leave the output on " \
     "\"Working space\" and let Resolve Color Management deliver Rec.709.\n\n" \
-    "Phase 1: a physically-grounded film tone scale (Hurter-Driffield negative " \
-    "and print characteristic curves with printer-light color timing), every " \
-    "curve shown on screen. Raise Strength to dial the look; tick Scope: H&D " \
-    "Curves to see the exact curve the pixels use.\n\n" \
+    "Speak models the photochemical chain: a Hurter-Driffield negative and print " \
+    "tone scale with printer-light timing (Stock Family presets), subtractive dye " \
+    "colour and split toning, optical halation / bloom / veil / vignette (Format " \
+    "presets set grain size and halation radius together), density-domain grain, " \
+    "and a deterministic gate weave. Every claim is shown on screen — the H&D and " \
+    "density scopes, the isolated Grain / Halation / Bloom views, and a status " \
+    "strip that says what the grain matte is doing right now.\n\n" \
+    "For the Hush handoff: set Matte Source to Key input and wire Hush's blue key " \
+    "output into Speak's key input — grain lands exactly where Hush cleaned. See " \
+    "View -> Setup Guide.\n\n" \
     "Hush quiets the noise; Speak gives the image its voice. MIT-licensed, free."
 #define kSpeakIdentifier "org.opennr.Speak"
 #define kSpeakVersionMajor 1
