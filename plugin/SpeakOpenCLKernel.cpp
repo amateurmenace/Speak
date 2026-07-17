@@ -555,6 +555,11 @@ inline float bloomSigmaPx(int H, const SpeakParams* pr)
     float s = pr->profile.bloomRadius * 0.01f * (float)H;
     return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
 }
+inline float bloomFinite(float v)
+{
+    /* see speak_core.h: contain EXR holes / upstream divides to one pixel */
+    return (v == v && v <= 3.402823e38f && v >= -3.402823e38f) ? v : 0.0f;
+}
 inline void bloomApplyPixel(float* r, float* g, float* b,
                             float sR, float sG, float sB,
                             const SpeakParams* pr)
@@ -600,6 +605,9 @@ inline void weaveSamplePixel(__global const float* img, int W, int H,
             out4[3] += w * img[o + 3];
         }
     }
+    /* alpha is the matte: clamp CR's invented out-of-[0,1] values (RGB keeps
+       the overshoot). See speak_core.h. */
+    out4[3] = out4[3] < 0.0f ? 0.0f : (out4[3] > 1.0f ? 1.0f : out4[3]);
 }
 
 inline float scopeYStops(float inStops, int ch, const SpeakParams* pr)
@@ -991,9 +999,13 @@ __kernel void SpeakNormalizeKernel(SpeakParams p, int W, int H,
     }
     float inv = 1.0f / (base + veil);
     size_t k = ((size_t)y * W + x) * 3;
-    scat[k + 0] = (arena[k + 0] + veil * meanC[0]) * inv;
-    scat[k + 1] = (arena[k + 1] + veil * meanC[1]) * inv;
-    scat[k + 2] = (arena[k + 2] + veil * meanC[2]) * inv;
+    /* meanC is only READ under isBloom: halation binds a placeholder whose
+       contents are undefined, and 0 * NaN is NaN — the guard is the fix. */
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    if (isBloom != 0) { a0 = veil * meanC[0]; a1 = veil * meanC[1]; a2 = veil * meanC[2]; }
+    scat[k + 0] = (arena[k + 0] + a0) * inv;
+    scat[k + 1] = (arena[k + 1] + a1) * inv;
+    scat[k + 2] = (arena[k + 2] + a2) * inv;
 }
 
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
@@ -1095,7 +1107,8 @@ __kernel void SpeakLookKernel(SpeakParams p, int W, int H,
     lookLinear(src[i + 0], src[i + 1], src[i + 2], sR, sG, sB,
                vignGain(x, y, W, H, &p), &p, &lr, &lg, &lb);
     applyGrain(&lr, &lg, &lb, src[i + 3], x, y, H, &p);
-    arena[j + 0] = lr; arena[j + 1] = lg; arena[j + 2] = lb;
+    /* contain non-finite inputs to ONE pixel — see speak_core.h bloomFinite */
+    arena[j + 0] = bloomFinite(lr); arena[j + 1] = bloomFinite(lg); arena[j + 2] = bloomFinite(lb);
 }
 
 // The veil's source: the frame mean, computed by ONE work-item over the

@@ -1009,6 +1009,12 @@ static inline void weaveSamplePixel(const float* img, int W, int H,
             out4[3] += w * img[o + 3];
         }
     }
+    // Alpha is the matte and its domain is [0,1]; Catmull-Rom's negative
+    // lobes invent values outside it at hard matte edges (measured: -0.079
+    // to +1.153). RGB keeps the overshoot — that is the sharpness — but a
+    // confidence no input pixel ever had is invented, and "alpha passes
+    // through" means un-invented.
+    out4[3] = out4[3] < 0.0f ? 0.0f : (out4[3] > 1.0f ? 1.0f : out4[3]);
 }
 
 // ---------------------------------------------------------------------------
@@ -1586,11 +1592,23 @@ inline void buildHalScatter(const float* src, int W, int H, const SpeakParams& p
 // header block for why this is its own build rather than a re-read of
 // halation's scene-referred excess pyramid. Same arena contract as
 // buildHalScatter; only called when bloom is live — see speakFrame.
+inline float bloomFinite(float v)
+{
+    // One EXR hole or upstream divide must stay ONE bad pixel. Without this,
+    // the pyramid's mean-preserving decimation carries a NaN into every
+    // level, the frame-mean veil adds it to every pixel (0*NaN is still
+    // NaN, so even veil 0 doesn't opt out), and bloomApplyPixel's lerp
+    // blanks the whole frame — measured, one texel to 24576/24576. Halation
+    // contains the same pixel by accident of halExcess's comparison; bloom
+    // contains it here, on purpose.
+    return (v == v && v <= 3.402823e38f && v >= -3.402823e38f) ? v : 0.0f;
+}
+
 inline void buildBloomScatter(const float* lookBuf, int W, int H, const SpeakParams& pr,
                               float* arena, float* scat)
 {
     const size_t n0 = static_cast<size_t>(W) * H * 3;
-    for (size_t k = 0; k < n0; ++k) arena[k] = lookBuf[k];
+    for (size_t k = 0; k < n0; ++k) arena[k] = bloomFinite(lookBuf[k]);
     const int nLev = halLevelCount(W, H);
     for (int L = 1; L < nLev; ++L) {
         int sw, sh, so, dw, dh, doff;
@@ -1683,6 +1701,12 @@ inline void speakFrame(const float* src, int W, int H, const SpeakParams& pr, fl
     }
     const float* bs = blm ? bloomScat.data() : nullptr;
 
+    // The parade measures the PRE-weave picture: a rigid sub-pixel shift
+    // does not change which densities exist, only where they sit. Measured
+    // bound: at UI-max weave the registration error is ~0.32 of a parade
+    // column bucket on 16:9 and can reach ~1.02 buckets on a portrait
+    // frame's worst wander — visible never, arguable once. Stated, not
+    // hidden.
     computeStats(src, sc, bs, W, H, pr, stats.data());   // measure the frame, then render
     const bool weave = weaveActive(pr);
     const int drawScopes = weave ? 0 : 1;

@@ -53,6 +53,9 @@ __device__ unsigned long long max(unsigned long long, unsigned long long);
 
 typedef struct CUstream_st* cudaStream_t;
 typedef int cudaError_t;
+// nvcc provides cudaSuccess (== 0); declared here so allocation-checking
+// host code type-checks, per this shim's documented purpose.
+static const cudaError_t cudaSuccess = 0;
 cudaError_t cudaMalloc(void** p, unsigned long n);
 template <typename T> cudaError_t cudaMalloc(T** p, unsigned long n) { return cudaMalloc((void**)p, n); }
 cudaError_t cudaFree(void* p);

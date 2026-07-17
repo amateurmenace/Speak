@@ -529,6 +529,11 @@ inline float bloomSigmaPx(int H, constant SpeakParams& pr)
     float s = pr.profile.bloomRadius * 0.01f * float(H);
     return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
 }
+inline float bloomFinite(float v)
+{
+    // see speak_core.h: contain EXR holes / upstream divides to one pixel
+    return (v == v && v <= 3.402823e38f && v >= -3.402823e38f) ? v : 0.0f;
+}
 inline void bloomApplyPixel(thread float& r, thread float& g, thread float& b,
                             float sR, float sG, float sB,
                             constant SpeakParams& pr)
@@ -574,6 +579,9 @@ inline void weaveSamplePixel(device const float* img, int W, int H,
             out4[3] += w * img[o + 3];
         }
     }
+    // Alpha is the matte: clamp CR's invented out-of-[0,1] values (RGB keeps
+    // the overshoot — that is the sharpness). See speak_core.h.
+    out4[3] = out4[3] < 0.0f ? 0.0f : (out4[3] > 1.0f ? 1.0f : out4[3]);
 }
 
 inline float scopeYStops(float inStops, int ch, constant SpeakParams& pr)
@@ -960,9 +968,14 @@ kernel void SpeakNormalizeKernel(constant SpeakParams& p [[buffer(0)]],
     }
     float inv = 1.0f / (base + veil);
     int o = (y * W + x) * 3;
-    scat[o + 0] = (arena[o + 0] + veil * meanC[0]) * inv;
-    scat[o + 1] = (arena[o + 1] + veil * meanC[1]) * inv;
-    scat[o + 2] = (arena[o + 2] + veil * meanC[2]) * inv;
+    // meanC is only READ under isBloom: halation binds a placeholder whose
+    // contents are undefined, and 0 * NaN is NaN — the guard is the fix,
+    // not the zero veil.
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    if (norm.isBloom != 0) { a0 = veil * meanC[0]; a1 = veil * meanC[1]; a2 = veil * meanC[2]; }
+    scat[o + 0] = (arena[o + 0] + a0) * inv;
+    scat[o + 1] = (arena[o + 1] + a1) * inv;
+    scat[o + 2] = (arena[o + 2] + a2) * inv;
 }
 
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
@@ -1068,7 +1081,10 @@ kernel void SpeakLookKernel(constant SpeakParams& p [[buffer(0)]],
     lookLinear(src[i + 0], src[i + 1], src[i + 2], sR, sG, sB,
                vignGain(x, y, W, H, p), p, lr, lg, lb);
     applyGrain(lr, lg, lb, src[i + 3], x, y, H, p);
-    arena[j + 0] = lr; arena[j + 1] = lg; arena[j + 2] = lb;
+    // One non-finite pixel must stay ONE pixel: unguarded, the pyramid mean
+    // and the veil term spread it to the whole frame (speak_core.h
+    // bloomFinite has the measurement).
+    arena[j + 0] = bloomFinite(lr); arena[j + 1] = bloomFinite(lg); arena[j + 2] = bloomFinite(lb);
 }
 
 // The veil's source: the frame mean, computed by ONE thread over the coarsest
@@ -1258,10 +1274,11 @@ struct SpeakRes {
     id<MTLBuffer> bloomMeanBuf = nil;
     id<MTLBuffer> preBuf = nil;         // weave: the pre-displacement picture
     size_t preFloats = 0;
-    // Bound in place of scatBuf when the whole chain is skipped, so the stats and
-    // main kernels always get a VALID binding (a null binding crashes). Its
-    // contents are never read: the kernels guard the load on the same condition
-    // the host uses to skip.
+    // Bound wherever a real buffer is skipped (scat, bloom scat, the veil
+    // mean), so every kernel gets a VALID binding (a null binding crashes).
+    // Every read of it is behind the same condition the host used to skip —
+    // including the normalize kernel's meanC, which is guarded on isBloom
+    // precisely because 0 * undefined-contents could be NaN.
     id<MTLBuffer> nullBuf = nil;
 };
 static std::mutex s_speakMutex;
@@ -1337,6 +1354,7 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
             // after its normalize), so one arena serves both pyramids.
             const size_t needArena = static_cast<size_t>(halArenaPixels(p_Width, p_Height)) * 3;
             if (r.arenaBuf == nil || r.arenaFloats < needArena) {
+                if (r.arenaBuf) [r.arenaBuf release];   // non-ARC file: grow paths must release
                 r.arenaBuf = [device newBufferWithLength:(needArena * sizeof(float))
                                                  options:MTLResourceStorageModePrivate];
                 r.arenaFloats = needArena;
@@ -1346,6 +1364,7 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
         if (wantHalAlloc) {
             const size_t needScat = static_cast<size_t>(p_Width) * p_Height * 3;
             if (r.scatBuf == nil || r.scatFloats < needScat) {
+                if (r.scatBuf) [r.scatBuf release];
                 r.scatBuf = [device newBufferWithLength:(needScat * sizeof(float))
                                                 options:MTLResourceStorageModePrivate];
                 r.scatFloats = needScat;
@@ -1355,6 +1374,7 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
         if (wantBloomAlloc) {
             const size_t needScat = static_cast<size_t>(p_Width) * p_Height * 3;
             if (r.bloomScatBuf == nil || r.bloomScatFloats < needScat) {
+                if (r.bloomScatBuf) [r.bloomScatBuf release];
                 r.bloomScatBuf = [device newBufferWithLength:(needScat * sizeof(float))
                                                      options:MTLResourceStorageModePrivate];
                 r.bloomScatFloats = needScat;
@@ -1367,6 +1387,7 @@ void RunMetalSpeak(void* p_CmdQ, int p_Width, int p_Height,
         if (weaveActive(p_Params)) {
             const size_t needPre = static_cast<size_t>(p_Width) * p_Height * 4;
             if (r.preBuf == nil || r.preFloats < needPre) {
+                if (r.preBuf) [r.preBuf release];
                 r.preBuf = [device newBufferWithLength:(needPre * sizeof(float))
                                                options:MTLResourceStorageModePrivate];
                 r.preFloats = needPre;

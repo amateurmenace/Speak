@@ -1089,7 +1089,7 @@ static void gateBloomEnergy()
         std::snprintf(label, sizeof label,
                       "G26a energy conserved (a=%.1f r=%.0f%% v=%.1f) rel=%.5f",
                       configs[k][0], configs[k][1], configs[k][2], rel);
-        check(rel < 0.02, label, (std::string("rel=") + std::to_string(rel)).c_str());
+        check(rel < 0.002, label, (std::string("rel=") + std::to_string(rel)).c_str());
     }
 
     // THE STRAWMAN MUST FAIL. Additive screen bloom (out = L + a*S) — the
@@ -1291,8 +1291,10 @@ static void gateBloomScopeSeesBloom()
 
 // =========================================================================
 // VIGNETTE GATES (G32-G34): closed-form cos^4, injection site, halation
-// coupling. WEAVE GATES (G35-G39): identity/determinism, Catmull-Rom
-// correctness, displacement statistics, pinned scopes, parade stability.
+// coupling. WEAVE GATES (G35-G38): identity/determinism, Catmull-Rom
+// correctness, displacement statistics, pinned scopes. REVIEW GATES
+// (G39-G42): the adversarial round's teeth — NaN containment, matte-domain
+// alpha, profile/share/anisotropy pins, and the views nobody had gated.
 // =========================================================================
 static void gateVignette()
 {
@@ -1412,13 +1414,38 @@ static void gateWeaveIdentity()
     check(std::memcmp(a.data(), src.data(), a.size() * sizeof(float)) != 0,
           "G35c the picture actually moved (weave is not a no-op)");
 
-    // alpha moved WITH the picture: displaced alpha equals a reference
-    // resample of the source alpha plane
-    float wdx, wdy; weaveDisp(pr, H, wdx, wdy);
-    float ref[4];
-    weaveSamplePixel(src.data(), W, H, 40.0f - wdx, 50.0f - wdy, ref);
-    const size_t ip = (static_cast<size_t>(50) * W + 40) * 4;
-    check(std::fabs(a[ip + 3] - ref[3]) < 1e-6f, "G35d alpha rides with the picture");
+    // alpha moved WITH the picture — probed ACROSS A HARD MATTE EDGE (the
+    // constant-alpha version of this check could not fail: review finding).
+    // The delivered matte must equal the clamped resample AND stay in [0,1]
+    // everywhere, every frame: CR's negative lobes invent confidences no
+    // input had, and the clamp in weaveSamplePixel is the fix under test.
+    {
+        std::vector<float> esrc(src);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x)
+                esrc[(static_cast<size_t>(y) * W + x) * 4 + 3] = (x < W / 2) ? 0.0f : 1.0f;
+        std::vector<float> edst(esrc.size());
+        float aMin = 1e9f, aMax = -1e9f;
+        for (int f = 0; f < 24; ++f) {
+            pr.frameIndex = f;
+            speakFrame(esrc.data(), W, H, pr, edst.data());
+            for (size_t k = 3; k < edst.size(); k += 4) {
+                aMin = std::fmin(aMin, edst[k]);
+                aMax = std::fmax(aMax, edst[k]);
+            }
+        }
+        check(aMin >= 0.0f && aMax <= 1.0f,
+              "G35d delivered matte stays in [0,1] across a hard edge, 24 frames",
+              (std::to_string(aMin) + ".." + std::to_string(aMax)).c_str());
+        pr.frameIndex = 137;
+        speakFrame(esrc.data(), W, H, pr, edst.data());
+        float wdx, wdy; weaveDisp(pr, H, wdx, wdy);
+        float ref[4];
+        weaveSamplePixel(esrc.data(), W, H, (W / 2 - 1) - wdx, 50.0f - wdy, ref);
+        const size_t ip = (static_cast<size_t>(50) * W + (W / 2 - 1)) * 4;
+        check(std::fabs(edst[ip + 3] - ref[3]) < 1e-6f,
+              "G35e alpha equals the (clamped) resample at the edge");
+    }
 
     // diagnostics hold still: the isolated views are not displaced
     pr.viewMode = SPEAK_VIEW_INPUT;
@@ -1531,6 +1558,167 @@ static void gateWeaveScopesPinned()
           (std::to_string(scopeDiff) + " differed").c_str());
 }
 
+static void gateNaNContainment()
+{
+    printf("G39 one bad pixel stays one bad pixel (bloom must not spread NaN)\n");
+    const int W = 192, H = 128;
+    std::vector<float> src, dst;
+    bloomScene(src, W, H, 5.0f, 0.18f, 1.0f, 1.0f, 1.0f);
+    src[(static_cast<size_t>(64) * W + 96) * 4 + 0] = std::numeric_limits<float>::quiet_NaN();
+    dst.resize(src.size());
+    SpeakParams pr = bloomParams(0.3f, 4.0f, 0.10f);   // DEFAULT veil: the worst case
+    speakFrame(src.data(), W, H, pr, dst.data());
+    int bad = 0;
+    for (size_t k = 0; k < dst.size(); k += 4)
+        for (int c = 0; c < 3; ++c)
+            if (!(dst[k + c] == dst[k + c])) { bad++; break; }
+    check(bad <= 1, "G39a NaN input -> at most the one source pixel is bad",
+          (std::to_string(bad) + " bad pixels").c_str());
+    src[(static_cast<size_t>(64) * W + 96) * 4 + 0] = std::numeric_limits<float>::infinity();
+    speakFrame(src.data(), W, H, pr, dst.data());
+    bad = 0;
+    for (size_t k = 0; k < dst.size(); k += 4)
+        for (int c = 0; c < 3; ++c)
+            if (!std::isfinite(dst[k + c])) { bad++; break; }
+    check(bad <= 1, "G39b Inf input -> at most the one source pixel is non-finite",
+          (std::to_string(bad) + " bad pixels").c_str());
+}
+
+static void gateProfilePins()
+{
+    printf("G40 the pyramid profiles and the veil share are pinned END TO END\n");
+    // The fall rates became ARGUMENTS; these pins are what keep them from
+    // being an ungated degree of freedom (review: halation running on
+    // bloom's skirt passed the whole suite).
+    const float sig = 40.0f;
+    float maxHal = 0.0f, maxBlm = 0.0f, halVsBlm = 0.0f;
+    for (int L = 0; L < 12; ++L) {
+        const float Lt = std::log2(sig / kHalSigmaC);
+        const float d = static_cast<float>(L) - Lt;
+        const float wantHal = (d <= 0.0f) ? std::exp2(3.0f * d) : std::exp2(-1.0f * d);
+        const float wantBlm = (d <= 0.0f) ? std::exp2(3.0f * d) : std::exp2(-0.5f * d);
+        maxHal = std::fmax(maxHal, std::fabs(halLevelWeight(L, sig, kHalCoreFall, kHalSkirtFall) - wantHal));
+        maxBlm = std::fmax(maxBlm, std::fabs(halLevelWeight(L, sig, kHalCoreFall, kBloomSkirtFall) - wantBlm));
+        if (d > 0.0f)
+            halVsBlm = std::fmax(halVsBlm,
+                halLevelWeight(L, sig, kHalCoreFall, kHalSkirtFall) /
+                halLevelWeight(L, sig, kHalCoreFall, kBloomSkirtFall));
+    }
+    check(maxHal < 1e-6f, "G40a halation weights == closed form (skirt 1.0)",
+          std::to_string(maxHal).c_str());
+    check(maxBlm < 1e-6f, "G40b bloom weights == closed form (skirt 0.5)",
+          std::to_string(maxBlm).c_str());
+    check(halVsBlm < 1.0f, "G40c bloom's skirt is strictly broader at every coarse level");
+
+    // The veil's SHARE is exactly v — as arithmetic through the real
+    // functions (review: a rescaled veilAdd passed G29a's structure check).
+    for (float v : { 0.25f, 0.5f, 0.9f }) {
+        SpeakParams pr = bloomParams(1.0f, 3.0f, v);
+        const int nLev = halLevelCount(192, 128);
+        const float s2 = bloomSigmaPx(128, pr);
+        const float base = halWeightSum(nLev, s2, kHalCoreFall, kBloomSkirtFall);
+        const float add = bloomVeilAdd(nLev, s2, pr);
+        const float share = add / (base + add);
+        check(std::fabs(share - v) < 1e-5f, "G40d veil share == v exactly",
+              (std::to_string(share) + " want " + std::to_string(v)).c_str());
+    }
+
+    // The transport-axis anisotropy is a stated 1.4x — pin it statistically
+    // (dx and dy draw from the same construction, differing only by the
+    // factor), so a silent constant change goes red.
+    SpeakParams pr = bloomParams(0.0f, 4.0f, 0.0f);
+    pr.profile.weaveAmount = 0.2f;
+    double sx2 = 0.0, sy2 = 0.0;
+    for (int f = 0; f < 65536; ++f) {   // >=1024 draws of the slowest octave
+        pr.frameIndex = f;
+        float dx, dy; weaveDisp(pr, 1080, dx, dy);
+        sx2 += static_cast<double>(dx) * dx;
+        sy2 += static_cast<double>(dy) * dy;
+    }
+    const double ratio = std::sqrt(sy2 / sx2);
+    check(std::fabs(ratio - 1.4) < 0.12,
+          "G40e transport anisotropy RMS(dy)/RMS(dx) ~= the stated 1.4",
+          std::to_string(ratio).c_str());
+}
+
+static void gateCRIsNotBilinear()
+{
+    printf("G41 the resampler is Catmull-Rom, not the bilinear strawman\n");
+    // G36's flat/linear reproduction is satisfied by bilinear too (review).
+    // CR's negative lobes are the distinguishing signature: pin the weights.
+    float w[4];
+    weaveCRw(0.5f, w);
+    check(std::fabs(w[0] + 0.0625f) < 1e-7f && std::fabs(w[1] - 0.5625f) < 1e-7f &&
+          std::fabs(w[2] - 0.5625f) < 1e-7f && std::fabs(w[3] + 0.0625f) < 1e-7f,
+          "G41a CR weights at t=0.5 (negative lobes present)");
+    // and behaviourally: a step edge OVERSHOOTS under CR, never under bilinear
+    const int W = 32, H = 8;
+    std::vector<float> img(static_cast<size_t>(W) * H * 4, 0.0f);
+    for (int y = 0; y < H; ++y)
+        for (int x = W / 2; x < W; ++x)
+            img[(static_cast<size_t>(y) * W + x) * 4 + 0] = 1.0f;
+    float out[4];
+    float mx = -1e9f, mn = 1e9f;
+    for (float t = 0.1f; t < 1.0f; t += 0.2f) {
+        weaveSamplePixel(img.data(), W, H, W / 2 + t, 4.0f, out);       // taps straddle: 0|1 1 1
+        mx = std::fmax(mx, out[0]);
+        weaveSamplePixel(img.data(), W, H, W / 2 - 2 + t, 4.0f, out);   // taps: 0 0 0|1
+        mn = std::fmin(mn, out[0]);
+    }
+    check(mx > 1.0f + 1e-4f && mn < -1e-4f,
+          "G41b step edge over/undershoots on RGB (interpolating kernel, not a tent)",
+          (std::to_string(mn) + ".." + std::to_string(mx)).c_str());
+}
+
+static void gateVignetteParadeAndBloomView()
+{
+    printf("G42 the parade sees vignette; the bloom view is honest\n");
+    const int W = 192, H = 128;
+    std::vector<float> src;
+    bloomScene(src, W, H, 8.0f, 0.10f, 2.0f, 2.0f, 2.0f);
+    // vignette-blind parade would draw corner columns brighter than the
+    // pixels — same L3 class as the scatter-blind scope (G17's rule).
+    SpeakParams pr = bloomParams(0.0f, 4.0f, 0.0f);
+    pr.enableTone = 1; pr.inputColorSpace = SPEAK_CS_LINEAR;
+    pr.profile.vignAmount = 1.0f; pr.profile.vignField = 45.0f;
+    pr.scopeDensity = 1;
+    std::vector<uint32_t> withV(SPEAK_STATS_UINTS), blind(SPEAK_STATS_UINTS);
+    computeStats(src.data(), nullptr, nullptr, W, H, pr, withV.data());
+    SpeakParams pr0 = pr; pr0.profile.vignAmount = 0.0f;
+    computeStats(src.data(), nullptr, nullptr, W, H, pr0, blind.data());
+    int diff = 0;
+    for (int k = 0; k < SPEAK_WF_COLS * SPEAK_WF_ROWS * 3; ++k)
+        if (withV[SPEAK_STATS_WF + k] != blind[SPEAK_STATS_WF + k]) diff++;
+    check(diff > 0, "G42a the parade measures the vignetted result",
+          (std::to_string(diff) + " cells differ").c_str());
+
+    // VIEW_BLOOM: a no-bloom pixel shows EXACTLY 18% gray (never auto-
+    // gained), and the frame's mean delta is ~0 (the signed view shows a
+    // conserving trade, not a glow overlay).
+    // dim disc: the view sits on 18% gray, so borrows deeper than -0.18
+    // clip at black and would bias this mean — representable deltas only
+    std::vector<float> vsrc;
+    bloomScene(vsrc, W, H, 8.0f, 0.05f, 0.35f, 0.35f, 0.35f);
+    std::vector<float> view(vsrc.size());
+    SpeakParams pv = bloomParams(0.6f, 3.0f, 0.2f);
+    pv.viewMode = SPEAK_VIEW_BLOOM;
+    speakFrame(vsrc.data(), W, H, pv, view.data());
+    double meanDelta = 0.0;
+    for (size_t k = 0; k < view.size(); k += 4)
+        meanDelta += (view[k] - k18Gray);
+    meanDelta /= (view.size() / 4);
+    check(std::fabs(meanDelta) < 2e-3,
+          "G42b bloom view's mean delta ~ 0 (borrowed == redistributed, on screen)",
+          std::to_string(meanDelta).c_str());
+    SpeakParams pOff = pv; pOff.profile.bloomAmount = 0.0f;
+    speakFrame(vsrc.data(), W, H, pOff, view.data());
+    float worst = 0.0f;
+    for (size_t k = 0; k < view.size(); k += 4)
+        worst = std::fmax(worst, std::fabs(view[k] - k18Gray));
+    check(worst < 1e-6f, "G42c bloom off -> the view is exactly flat gray (no auto-gain)",
+          std::to_string(worst).c_str());
+}
+
 int main()
 {
     printf("=== Speak CPU gate suite ===\n");
@@ -1571,6 +1759,10 @@ int main()
     gateWeaveCR();
     gateWeaveStats();
     gateWeaveScopesPinned();
+    gateNaNContainment();
+    gateProfilePins();
+    gateCRIsNotBilinear();
+    gateVignetteParadeAndBloomView();
     printf("\n%s (%d failures)\n", g_fail ? "FAILED" : "ALL GATES GREEN", g_fail);
     return g_fail ? 1 : 0;
 }

@@ -191,9 +191,20 @@ public:
         // Halation only exists inside the tone spine (it re-exposes the
         // negative), so it cannot make the node non-identity on its own.
         // Grain CAN: it is emulsion noise on whatever image arrives, standalone
-        // like dye/split.
+        // like dye/split. And so can the OTHER optics: bloom, vignette and
+        // gate weave act on any look's output — an isIdentity that ignored
+        // them made the HOST skip the render exactly when they ran standalone
+        // (found by adversarial review; the kernels were fine, the node never
+        // got asked).
         const bool grainOn = m_EnableGrain->getValueAtTime(t) && (m_GrainAmount->getValueAtTime(t) > 0.0);
-        if (!toneOn && !dyeOn && !splitOn && !grainOn) { p_IdentityClip = m_SrcClip; p_IdentityTime = t; return true; }
+        const bool sOn = m_Strength->getValueAtTime(t) > 0.0;
+        const bool opticsOn = m_EnableOptics->getValueAtTime(t) && sOn &&
+                              (m_BloomAmount->getValueAtTime(t) > 0.0 ||
+                               m_VignAmount->getValueAtTime(t) > 0.0 ||
+                               m_WeaveAmount->getValueAtTime(t) > 0.0);
+        if (!toneOn && !dyeOn && !splitOn && !grainOn && !opticsOn) {
+            p_IdentityClip = m_SrcClip; p_IdentityTime = t; return true;
+        }
         return false;
     }
 
@@ -208,7 +219,11 @@ private:
     void updateEnabledness()
     {
         const bool on = m_EnableTone->getValue();
-        m_Strength->setEnabled(on);
+        // Strength is the global look mix and the NEW optics (bloom, vignette,
+        // weave) ride it even with Film Tone off — greying it under tone-off
+        // would strand controls that genuinely respond to it (review finding).
+        const bool opticsMix = m_EnableOptics->getValue();
+        m_Strength->setEnabled(on || opticsMix);
         m_Contrast->setEnabled(on);
         m_PrintShoulder->setEnabled(on);
         m_Toe->setEnabled(on);
@@ -656,7 +671,8 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                       "(that one needs Film Tone on — no negative, nothing to re-expose); bloom "
                       "and its veiling floor are glare in the viewing optics AFTER the print, "
                       "energy-conserving by construction; gate weave is the transport's "
-                      "sub-pixel picture wander. The isolated Views show exactly what each adds.");
+                      "sub-pixel picture wander. Halation, bloom and grain have isolated Views "
+                      "showing exactly what they add; vignette and weave are visible directly.");
 
     sDefBool(p_Desc, page, "enableOptics", "Enable Light",
              "Toggle the whole optical group (vignette, halation, bloom, gate weave) to "
@@ -670,6 +686,11 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                "scale on a proxy and at full res. Around 1% is the order of real 35mm "
                "base-reflection geometry; it is a starting point, not a measured stock.",
                1.0, 0.05, 8.0, 0.01, grpLight);
+    sDefDouble(p_Desc, page, "halThresh", "Halation Threshold",
+               "Scene-linear level above which light scatters. This is a practical control for "
+               "keeping the effect in the highlights, not a property of film — real emulsion "
+               "scatters every photon.", 0.6, 0.0, 8.0, 0.01, grpLight);
+
     sDefDouble(p_Desc, page, "bloomAmount", "Bloom",
                "Glare in the viewing optics, AFTER the print: an energy-conserving mix — the "
                "halo's light is borrowed from the highlight, never invented (total linear "
@@ -684,7 +705,8 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
     sDefDouble(p_Desc, page, "bloomVeil", "Veiling Floor",
                "The far-field share of the scattered light: a uniform lift that scales with the "
                "frame's own luminance (the published veiling-glare behaviour of camera optics). "
-               "Raising it trades halo for floor — the total stays conserved.",
+               "Raising it trades halo for floor; the trade is energy-neutral away from the "
+               "frame edges (border clamp leaks a little at the very edge, as with halation).",
                0.10, 0.0, 0.9, 0.01, grpLight);
     sDefDouble(p_Desc, page, "vignAmount", "Vignette",
                "Natural cos^4 illumination falloff of the taking lens, applied to the light "
@@ -708,10 +730,6 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
                "Time scale of the weave pattern. 1 = the modelled default transport; higher "
                "is a nervier gate, lower a lazier one.",
                1.0, 0.1, 4.0, 0.01, grpLight);
-    sDefDouble(p_Desc, page, "halThresh", "Halation Threshold",
-               "Scene-linear level above which light scatters. This is a practical control for "
-               "keeping the effect in the highlights, not a property of film — real emulsion "
-               "scatters every photon.", 0.6, 0.0, 8.0, 0.01, grpLight);
 
     // ---------------------------------------------------------------- 6 · Grain
     // Standalone (no spine required): grain is the emulsion's own noise on
@@ -756,7 +774,9 @@ void SpeakPluginFactory::describeInContext(OFX::ImageEffectDescriptor& p_Desc, O
         c->setLabels("View", "View", "View");
         c->setHint("Result / Split (input | result) / Input for comparing. Halation Scatter shows "
                    "the scattered light on its own, in the same units as the picture — it is not "
-                   "brightened to look impressive, so a small halo correctly looks small.");
+                   "brightened to look impressive, so a small halo correctly looks small. Bloom "
+                   "shows that module's SIGNED change on gray: the darkening at a source is the "
+                   "same light as the glow around it, and neither is ever auto-gained.");
         c->appendOption("Result");
         c->appendOption("Split (Input | Result)");
         c->appendOption("Input (Original)");

@@ -528,6 +528,11 @@ __device__ inline float bloomSigmaPx(int H, const SpeakParams& pr)
     float s = pr.profile.bloomRadius * 0.01f * (float)H;
     return s < SPEAK_HAL_SIGMA_MIN ? SPEAK_HAL_SIGMA_MIN : s;
 }
+__device__ inline float bloomFinite(float v)
+{
+    // see speak_core.h: contain EXR holes / upstream divides to one pixel
+    return (v == v && v <= 3.402823e38f && v >= -3.402823e38f) ? v : 0.0f;
+}
 __device__ inline void bloomApplyPixel(float& r, float& g, float& b,
                                        float sR, float sG, float sB,
                                        const SpeakParams& pr)
@@ -573,6 +578,8 @@ __device__ inline void weaveSamplePixel(const float* img, int W, int H,
             out4[3] += w * img[o + 3];
         }
     }
+    // alpha is the matte: clamp CR's invented out-of-[0,1] values
+    out4[3] = out4[3] < 0.0f ? 0.0f : (out4[3] > 1.0f ? 1.0f : out4[3]);
 }
 
 __device__ inline float scopeYStops(float inStops, int ch, const SpeakParams& pr)
@@ -959,9 +966,12 @@ __global__ void SpeakNormalizeKernel(SpeakParams p, int W, int H, int nLev,
     }
     float inv = 1.0f / (base + veil);
     size_t o = ((size_t)y * W + x) * 3;   // level 0's arena offset is 0
-    scat[o + 0] = (arena[o + 0] + veil * meanC[0]) * inv;
-    scat[o + 1] = (arena[o + 1] + veil * meanC[1]) * inv;
-    scat[o + 2] = (arena[o + 2] + veil * meanC[2]) * inv;
+    // meanC is only READ under isBloom (0 * undefined could be NaN)
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    if (isBloom != 0) { a0 = veil * meanC[0]; a1 = veil * meanC[1]; a2 = veil * meanC[2]; }
+    scat[o + 0] = (arena[o + 0] + a0) * inv;
+    scat[o + 1] = (arena[o + 1] + a1) * inv;
+    scat[o + 2] = (arena[o + 2] + a2) * inv;
 }
 
 // Scope measurement pass: bin the frame on a stride-2 grid. Integer atomics are
@@ -1050,7 +1060,8 @@ __global__ void SpeakLookKernel(SpeakParams p, int W, int H,
                scat ? scat[j + 2] : 0.0f,
                vignGain(x, y, W, H, p), p, lr, lg, lb);
     applyGrain(lr, lg, lb, s.w, x, y, H, p);
-    arena[j + 0] = lr; arena[j + 1] = lg; arena[j + 2] = lb;
+    // contain non-finite inputs to ONE pixel — see speak_core.h bloomFinite
+    arena[j + 0] = bloomFinite(lr); arena[j + 1] = bloomFinite(lg); arena[j + 2] = bloomFinite(lb);
 }
 
 // The veil's source: the frame mean, computed by ONE thread over the coarsest
@@ -1141,13 +1152,13 @@ struct SpeakCudaRes
                                      // BOTH pyramids (bloom reuses it sequentially
                                      // once halation's content is dead), so it is
                                      // tracked on its own size marker
-    int arnW = 0, arnH = 0;
+    size_t arnFloats = 0;
     float* scat = nullptr;           // halation: W * H * 3 floats
-    int halW = 0, halH = 0;
+    size_t halFloats = 0;
     float* bscat = nullptr;          // bloom: W * H * 3 floats (LOOK-referred)
-    int blmW = 0, blmH = 0;
+    size_t blmFloats = 0;
     float* pre = nullptr;            // weave: the pre-displacement picture, W*H*4
-    int preW = 0, preH = 0;
+    size_t preFloats = 0;
 };
 
 // ---- gate weave, host side: the displacement is frame-uniform, so it is
@@ -1239,29 +1250,44 @@ void RunCudaSpeak(void* p_Stream, int p_Width, int p_Height,
         // sequentially once halation's content is dead), so it has its own
         // size marker: a bloom-only render must not leave a stale halation
         // plane hidden behind a shared one.
-        if ((hal || blm) && (!r.arena || r.arnW != p_Width || r.arnH != p_Height)) {
+        // Grow-only (Metal's policy): a proxy<->full-res flip must not
+        // free+malloc hundreds of MB per switch (cudaFree implicitly syncs).
+        // And every cudaMalloc is CHECKED: unchecked, VRAM exhaustion becomes
+        // null-pointer kernel writes that poison the whole CUDA context.
+        bool allocOK = true;
+        const size_t needArena = static_cast<size_t>(arenaPix) * 3;
+        if ((hal || blm) && (!r.arena || r.arnFloats < needArena)) {
             if (r.arena) { cudaFree(r.arena); r.arena = nullptr; }
-            cudaMalloc(&r.arena, static_cast<size_t>(arenaPix) * 3 * sizeof(float));
-            r.arnW = p_Width;
-            r.arnH = p_Height;
+            allocOK = allocOK &&
+                (cudaMalloc(&r.arena, needArena * sizeof(float)) == cudaSuccess);
+            r.arnFloats = allocOK ? needArena : 0;
         }
-        if (hal && (!r.scat || r.halW != p_Width || r.halH != p_Height)) {
+        const size_t needScat = static_cast<size_t>(p_Width) * p_Height * 3;
+        if (hal && (!r.scat || r.halFloats < needScat)) {
             if (r.scat) { cudaFree(r.scat); r.scat = nullptr; }
-            cudaMalloc(&r.scat, static_cast<size_t>(p_Width) * p_Height * 3 * sizeof(float));
-            r.halW = p_Width;
-            r.halH = p_Height;
+            allocOK = allocOK &&
+                (cudaMalloc(&r.scat, needScat * sizeof(float)) == cudaSuccess);
+            r.halFloats = allocOK ? needScat : 0;
         }
-        if (blm && (!r.bscat || r.blmW != p_Width || r.blmH != p_Height)) {
+        if (blm && (!r.bscat || r.blmFloats < needScat)) {
             if (r.bscat) { cudaFree(r.bscat); r.bscat = nullptr; }
-            cudaMalloc(&r.bscat, static_cast<size_t>(p_Width) * p_Height * 3 * sizeof(float));
-            r.blmW = p_Width;
-            r.blmH = p_Height;
+            allocOK = allocOK &&
+                (cudaMalloc(&r.bscat, needScat * sizeof(float)) == cudaSuccess);
+            r.blmFloats = allocOK ? needScat : 0;
         }
-        if (weave && (!r.pre || r.preW != p_Width || r.preH != p_Height)) {
+        const size_t needPre = static_cast<size_t>(p_Width) * p_Height * 4;
+        if (weave && (!r.pre || r.preFloats < needPre)) {
             if (r.pre) { cudaFree(r.pre); r.pre = nullptr; }
-            cudaMalloc(&r.pre, static_cast<size_t>(p_Width) * p_Height * 4 * sizeof(float));
-            r.preW = p_Width;
-            r.preH = p_Height;
+            allocOK = allocOK &&
+                (cudaMalloc(&r.pre, needPre * sizeof(float)) == cudaSuccess);
+            r.preFloats = allocOK ? needPre : 0;
+        }
+        if (!allocOK ||
+            ((hal || blm) && !r.arena) || (hal && !r.scat) ||
+            (blm && !r.bscat) || (weave && !r.pre)) {
+            fprintf(stderr, "Speak/CUDA: buffer allocation failed — frame skipped\n");
+            s_locker.Unlock();
+            return;
         }
         res = r;
     }
